@@ -1,0 +1,749 @@
+[
+  {
+    "name": "allowed_emails",
+    "columns": [
+      {
+        "name": "email",
+        "type": "String",
+        "length": 320,
+        "nullable": false,
+        "primary_key": true,
+        "foreign_key": null
+      },
+      {
+        "name": "active",
+        "type": "Boolean",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      }
+    ],
+    "unique": [],
+    "indexes": []
+  },
+  {
+    "name": "api_usage",
+    "columns": [
+      {
+        "name": "id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": true,
+        "foreign_key": null
+      },
+      {
+        "name": "meeting_id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "user_id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "operation",
+        "type": "String",
+        "length": 12,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "model",
+        "type": "String",
+        "length": 200,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "generation_id",
+        "type": "String",
+        "length": 200,
+        "nullable": true,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "request_id",
+        "type": "String",
+        "length": 200,
+        "nullable": true,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "cost",
+        "type": "Float",
+        "length": null,
+        "nullable": true,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "cost_source",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "units",
+        "type": "JSON",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "created",
+        "type": "Float",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      }
+    ],
+    "unique": [],
+    "indexes": [
+      {
+        "name": "ix_api_usage_meeting_id",
+        "columns": [
+          "meeting_id"
+        ],
+        "unique": false
+      },
+      {
+        "name": "ix_api_usage_user_id",
+        "columns": [
+          "user_id"
+        ],
+        "unique": false
+      }
+    ]
+  },
+  {
+    "name": "rate_buckets",
+    "columns": [
+      {
+        "name": "key",
+        "type": "String",
+        "length": 300,
+        "nullable": false,
+        "primary_key": true,
+        "foreign_key": null
+      },
+      {
+        "name": "count",
+        "type": "Integer",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "expires",
+        "type": "Float",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      }
+    ],
+    "unique": [],
+    "indexes": []
+  },
+  {
+    "name": "users",
+    "columns": [
+      {
+        "name": "id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": true,
+        "foreign_key": null
+      },
+      {
+        "name": "email",
+        "type": "String",
+        "length": 320,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "name",
+        "type": "String",
+        "length": 200,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "role",
+        "type": "String",
+        "length": 16,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "password_hash",
+        "type": "Text",
+        "length": null,
+        "nullable": true,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "created",
+        "type": "Float",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      }
+    ],
+    "unique": [
+      [
+        "email"
+      ]
+    ],
+    "indexes": []
+  },
+  {
+    "name": "meetings",
+    "columns": [
+      {
+        "name": "id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": true,
+        "foreign_key": null
+      },
+      {
+        "name": "user_id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": "users.id"
+      },
+      {
+        "name": "upload_key",
+        "type": "String",
+        "length": 64,
+        "nullable": true,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "title",
+        "type": "String",
+        "length": 200,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "created",
+        "type": "Float",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "duration",
+        "type": "Float",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "status",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "error",
+        "type": "Text",
+        "length": null,
+        "nullable": true,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "original_path",
+        "type": "Text",
+        "length": null,
+        "nullable": true,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "original_name",
+        "type": "String",
+        "length": 250,
+        "nullable": true,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "media_type",
+        "type": "String",
+        "length": 100,
+        "nullable": true,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "language",
+        "type": "String",
+        "length": 8,
+        "nullable": true,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "retain_source",
+        "type": "Boolean",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "detail",
+        "type": "String",
+        "length": 16,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "transcript_version",
+        "type": "Integer",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "summary_version",
+        "type": "Integer",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      }
+    ],
+    "unique": [
+      [
+        "user_id",
+        "upload_key"
+      ]
+    ],
+    "indexes": [
+      {
+        "name": "ix_meetings_user_id",
+        "columns": [
+          "user_id"
+        ],
+        "unique": false
+      }
+    ]
+  },
+  {
+    "name": "sessions",
+    "columns": [
+      {
+        "name": "token_hash",
+        "type": "String",
+        "length": 64,
+        "nullable": false,
+        "primary_key": true,
+        "foreign_key": null
+      },
+      {
+        "name": "user_id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": "users.id"
+      },
+      {
+        "name": "csrf",
+        "type": "String",
+        "length": 64,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "expires",
+        "type": "Float",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      }
+    ],
+    "unique": [],
+    "indexes": []
+  },
+  {
+    "name": "audio_outputs",
+    "columns": [
+      {
+        "name": "id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": true,
+        "foreign_key": null
+      },
+      {
+        "name": "meeting_id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": "meetings.id"
+      },
+      {
+        "name": "summary_version",
+        "type": "Integer",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "model",
+        "type": "String",
+        "length": 200,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "voice",
+        "type": "String",
+        "length": 200,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "path",
+        "type": "Text",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      }
+    ],
+    "unique": [
+      [
+        "meeting_id",
+        "summary_version",
+        "model",
+        "voice"
+      ]
+    ],
+    "indexes": [
+      {
+        "name": "ix_audio_outputs_meeting_id",
+        "columns": [
+          "meeting_id"
+        ],
+        "unique": false
+      }
+    ]
+  },
+  {
+    "name": "jobs",
+    "columns": [
+      {
+        "name": "id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": true,
+        "foreign_key": null
+      },
+      {
+        "name": "meeting_id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": "meetings.id"
+      },
+      {
+        "name": "kind",
+        "type": "String",
+        "length": 20,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "request_key",
+        "type": "String",
+        "length": 100,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "state",
+        "type": "String",
+        "length": 20,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "stage",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "completed",
+        "type": "Integer",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "total",
+        "type": "Integer",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "payload",
+        "type": "JSON",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "checkpoint",
+        "type": "JSON",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "error",
+        "type": "Text",
+        "length": null,
+        "nullable": true,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "created",
+        "type": "Float",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "heartbeat",
+        "type": "Float",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      }
+    ],
+    "unique": [
+      [
+        "meeting_id",
+        "request_key"
+      ]
+    ],
+    "indexes": [
+      {
+        "name": "ix_jobs_meeting_id",
+        "columns": [
+          "meeting_id"
+        ],
+        "unique": false
+      },
+      {
+        "name": "ix_jobs_state",
+        "columns": [
+          "state"
+        ],
+        "unique": false
+      }
+    ]
+  },
+  {
+    "name": "summaries",
+    "columns": [
+      {
+        "name": "id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": true,
+        "foreign_key": null
+      },
+      {
+        "name": "meeting_id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": "meetings.id"
+      },
+      {
+        "name": "version",
+        "type": "Integer",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "transcript_version",
+        "type": "Integer",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "content",
+        "type": "JSON",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "created",
+        "type": "Float",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      }
+    ],
+    "unique": [
+      [
+        "meeting_id",
+        "version"
+      ]
+    ],
+    "indexes": [
+      {
+        "name": "ix_summaries_meeting_id",
+        "columns": [
+          "meeting_id"
+        ],
+        "unique": false
+      }
+    ]
+  },
+  {
+    "name": "transcripts",
+    "columns": [
+      {
+        "name": "id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": true,
+        "foreign_key": null
+      },
+      {
+        "name": "meeting_id",
+        "type": "String",
+        "length": 32,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": "meetings.id"
+      },
+      {
+        "name": "version",
+        "type": "Integer",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "text",
+        "type": "Text",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "segments",
+        "type": "JSON",
+        "length": null,
+        "nullable": false,
+        "primary_key": false,
+        "foreign_key": null
+      },
+      {
+        "name": "language",
+        "type": "String",
+        "length": 32,
+        "nullable": true,
+        "primary_key": false,
+        "foreign_key": null
+      }
+    ],
+    "unique": [
+      [
+        "meeting_id",
+        "version"
+      ]
+    ],
+    "indexes": [
+      {
+        "name": "ix_transcripts_meeting_id",
+        "columns": [
+          "meeting_id"
+        ],
+        "unique": false
+      }
+    ]
+  }
+]

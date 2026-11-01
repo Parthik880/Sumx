@@ -1,0 +1,13 @@
+fastapi==0.162.0
+uvicorn==0.54.0
+sqlalchemy==2.0.44
+alembic==1.17.2
+httpx==0.28.1
+pydantic-settings==2.16.2
+python-multipart==0.0.32
+argon2-cffi==25.1.0
+google-auth[requests]==2.62.0
+itsdangerous==2.2.0
+pytest==9.2.0
+ruff==0.14.6
+starlette==1.10.0
