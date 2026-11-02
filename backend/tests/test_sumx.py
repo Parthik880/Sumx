@@ -48,6 +48,14 @@ class MockRouter:
         self.calls = []
         self.fail_summary = fail_summary
 
+    def async_client(self):
+        return httpx.AsyncClient()
+
+    async def transcribe_async(self, path, language, client):
+        part, data, response = self.transcribe(path, language)
+        timing = dict(upload_seconds=0, provider_seconds=0, download_seconds=0, retries=0, backoff_seconds=0)
+        return part, data, response, timing
+
     def transcribe(self, path, language):
         self.calls.append("stt")
         return (
@@ -60,7 +68,7 @@ class MockRouter:
             httpx.Response(200, headers={"x-generation-id": "stt-generation"}),
         )
 
-    def summarize(self, text, detail, synthesis=False):
+    def summarize(self, text, detail, synthesis=False, **options):
         self.calls.append("llm")
         if self.fail_summary:
             raise ProviderError("Summary provider unavailable")
@@ -88,10 +96,20 @@ class MockRouter:
             capture_output=True,
             check=True,
         ).stdout
-        return data, {}, httpx.Response(200, headers={"x-generation-id": "tts-generation"})
+        return (
+            data,
+            {},
+            httpx.Response(200, headers={"x-generation-id": f"tts-{len(self.calls)}"}),
+        )
+
+    def speech_rate(self):
+        return None
+
+    async def speech_async(self, text, voice, client):
+        return self.speech(text, voice)
 
     def voices(self):
-        return [settings.openrouter_tts_voice]
+        return [settings.tts_default_voice]
 
 
 def test_pipeline_partial_failure_retry_and_versions(user_client):
@@ -131,7 +149,9 @@ def test_pipeline_partial_failure_retry_and_versions(user_client):
     assert user_client.get(f"/api/meetings/{m_id}/audio/{audio_id}").status_code == 404
     assert user_client.get("/api/meetings/" + m_id).json()["audio"] == []
     with DB() as db:
-        assert db.scalar(select(Usage).where(Usage.operation == "tts")).cost is None
+        speech = db.scalar(select(Usage).where(Usage.operation == "tts"))
+        assert speech.provider == "openrouter" and speech.voice_type == "preset"
+        assert speech.model == settings.openrouter_tts_model
 
 
 def test_upload_validation_idempotency_and_ownership(user_client):
@@ -197,7 +217,7 @@ def test_csrf_role_checks_allowlist_and_login_rate_limit(user_client):
 
 def test_admin_access_and_unknown_costs(admin_client):
     assert admin_client.post("/api/admin/users", json={"email": "Student@College.edu"}).status_code == 200
-    assert admin_client.get("/api/admin/users").json() == [{"email": "student@college.edu", "active": True}]
+    assert admin_client.get("/api/admin/approved-users").json()["users"][0]["email"] == "student@college.edu"
     with DB() as db:
         db.add(
             Usage(
@@ -206,8 +226,8 @@ def test_admin_access_and_unknown_costs(admin_client):
         )
         db.commit()
     analytics = admin_client.get("/api/admin/analytics").json()
-    assert analytics["totals"]["reported_cost"] == 0
-    assert analytics["totals"]["unknown_requests"] == 1
+    assert analytics["costs"]["total"]["known_usd"] is None
+    assert analytics["costs"]["total"]["pending_requests"] == 1
     assert admin_client.delete("/api/admin/users/student@college.edu").status_code == 200
     assert admin_client.post("/api/auth/logout").status_code == 200
     assert admin_client.get("/api/admin/users").status_code == 401
@@ -279,8 +299,6 @@ def test_provider_contracts_and_malformed_responses(tmp_path):
     assert transcript["segments"][0]["start"] == 0
     assert "speaker" not in transcript["segments"][0]
     assert router.summarize("Hello", "standard")[0]["title"] == "Library planning"
-    with pytest.raises(ProviderError, match="invalid MP3"):
-        router.speech("Hello", settings.openrouter_tts_voice)
     for payload in [{"text": None}, {"error": "failed"}, ["not a dictionary"]]:
         router = OpenRouter(
             httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=payload)))
@@ -345,6 +363,7 @@ def test_chunk_checkpoint_and_worker_restart(user_client, monkeypatch):
         job_id = job.id
         db.commit()
     monkeypatch.setattr(settings, "audio_chunk_seconds", 1)
+    monkeypatch.setattr(settings, "stt_overlap_seconds", 0)
     provider = MockRouter()
     original = provider.transcribe
     calls = 0
@@ -359,7 +378,7 @@ def test_chunk_checkpoint_and_worker_restart(user_client, monkeypatch):
     provider.transcribe = fail_second
     process_job(job_id, provider)
     with DB() as db:
-        assert len(db.get(Job, job_id).checkpoint["transcription_parts"]) == 1
+        assert len(db.get(Job, job_id).checkpoint["stt_parts"]) >= 1
     # Resume only the missing chunk, including its source offset.
     provider.transcribe = original
     user_client.post(f"/api/meetings/{m_id}/jobs/{job_id}/retry")

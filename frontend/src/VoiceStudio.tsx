@@ -30,6 +30,7 @@ type Voice = {
   preview_stage?: string;
   reference_text: string;
   usable: boolean;
+  reenrollment_required?: boolean;
 };
 type Capability = {
   model: string;
@@ -39,14 +40,15 @@ type Capability = {
   gpu_available?: boolean;
   gpu_name?: string;
   accepting?: boolean;
+  preview_text?: string;
 };
 type Selection =
   | { voice_type: "preset"; preset_voice_id: string | null }
   | { voice_type: "cloned"; cloned_voice_id: string };
 const PARAGRAPH =
-  "Hello, and welcome to my personal voice studio. Today, I am creating a voice that can help narrate meeting summaries clearly and naturally. Each conversation brings new ideas, important decisions, and meaningful discussions. My goal is to make these summaries easier to understand, remember, and revisit whenever they are needed.";
+  "Today I am recording a clear sample of my natural voice. I am speaking at a comfortable pace in a quiet room. This recording will help create my personal narrator.";
 const CONSENT =
-  "I confirm this is my own voice, or I have the speaker's explicit permission to create and use this voice.";
+  "I confirm this is my own voice, or I have the speaker's explicit permission to create and use this voice. The recording contains one speaker.";
 
 function CapabilityNotice({
   capability,
@@ -61,16 +63,14 @@ function CapabilityNotice({
       <div>
         <strong>
           {capability?.supported
-            ? "Local voice studio · GPU ready"
+            ? "Voice studio · GPU ready"
             : capability?.state === "loading"
-              ? "Loading your local voice model…"
+              ? "Loading your voice model…"
               : capability?.state === "warming_up"
                 ? "Preparing GPU acceleration…"
-                : "Local voice studio · GPU unavailable"}
+                : "Voice studio · GPU unavailable"}
         </strong>
-        <p>
-          {capability?.message || "Checking your private local voice worker."}
-        </p>
+        <p>{capability?.message || "Checking the private voice service."}</p>
         {capability?.model && (
           <small>
             {capability.gpu_name || "NVIDIA worker"} ·{" "}
@@ -222,7 +222,7 @@ export function VoiceStudio() {
                 {date(v.created)} · {duration(v.duration)} sample ·{" "}
                 {v.language.toUpperCase()}
               </small>
-              {v.has_preview && (
+              {v.has_preview && v.preview_current && (
                 <audio
                   aria-label={v.name + " preview"}
                   controls
@@ -722,7 +722,7 @@ export function VoiceCreator() {
               <div>
                 <h2>Let your voice do the talking</h2>
                 <p>
-                  Read this paragraph naturally in a quiet space. Aim for 15–30
+                  Read this paragraph naturally in a quiet space. Aim for 5–15
                   seconds.
                 </p>
               </div>
@@ -739,7 +739,7 @@ export function VoiceCreator() {
               />
               <small>
                 Edit this to match the words you actually recorded. Existing
-                voices need a confirmed transcript before local generation.
+                voices need a confirmed transcript before generation.
               </small>
             </label>
             <div className="voice-recorder">
@@ -853,10 +853,12 @@ export function VoiceCreator() {
               <span>{CONSENT}</span>
             </label>
             <p className="voice-privacy">
-              <ShieldCheckIcon /> Your reference stays on this computer and is
-              private to your account. Qwen3-TTS generates cloned speech locally
-              on the NVIDIA GPU. You can permanently delete your voice and its
-              reference recordings at any time.
+              <ShieldCheckIcon /> Your reference is stored privately on the SUMX
+              server and is private to your account. Reference transcription
+              uses your configured speech-to-text service. Qwen3-TTS generates
+              cloned speech on private Modal cloud GPUs, which receive your
+              recording only while generating. You can permanently delete your
+              voice and its reference recordings at any time.
             </p>
           </section>
           <section className="voice-panel">
@@ -867,9 +869,17 @@ export function VoiceCreator() {
                 <p>Review a real generated preview before saving.</p>
               </div>
             </div>
+            {profile?.reenrollment_required && (
+              <p className="voice-availability">
+                This saved reference needs validation and a fresh preview for
+                the updated speech engine. Your recording and existing
+                narrations are preserved.
+              </p>
+            )}
             <p className="voice-preview-quote">
-              “Hello! This is my new voice in SUMX. I can now narrate my meeting
-              summaries.”
+              {capability?.preview_text
+                ? `“${capability.preview_text}”`
+                : "Loading preview text…"}
             </p>
             {profile?.has_preview &&
             profile.preview_current &&
@@ -923,7 +933,7 @@ export function VoiceCreator() {
                 >
                   <PlayIcon />
                   {profile?.preview_running
-                    ? "Generating locally…"
+                    ? "Generating…"
                     : busy
                       ? "Processing…"
                       : profile
@@ -956,11 +966,11 @@ export function VoiceCreator() {
                   {
                     queued: "Waiting for the GPU…",
                     preparing_voice: "Preparing your voice…",
-                    generating_speech: "Generating speech on your GPU…",
-                    generating_audio: "Streaming speech on your GPU…",
+                    generating_speech: "Generating speech on the GPU…",
+                    generating_audio: "Generating speech on the GPU…",
                     encoding_audio: "Preparing playback…",
                   } as Record<string, string>
-                )[profile.preview_stage || "queued"] || "Generating locally…"}
+                )[profile.preview_stage || "queued"] || "Generating…"}
               </p>
             )}
             {profile?.preview_error && (
@@ -977,6 +987,13 @@ export function VoiceCreator() {
   );
 }
 
+type PresetVoice = {
+  id: string;
+  name: string;
+  description: string;
+  preview_url: string | null;
+};
+
 export function NarrationPicker({
   disabled,
   generate,
@@ -985,13 +1002,14 @@ export function NarrationPicker({
   generate: (selection: Selection) => Promise<void>;
 }) {
   const [type, setType] = useState<"preset" | "cloned">("preset"),
-    [presets, setPresets] = useState<string[]>([]),
+    [presets, setPresets] = useState<PresetVoice[]>([]),
     [preset, setPreset] = useState(""),
     [voices, setVoices] = useState<Voice[]>([]),
     [selected, setSelected] = useState(""),
     [query, setQuery] = useState(""),
     [error, setError] = useState(""),
     [loading, setLoading] = useState(false);
+  const previewPlayer = useRef<HTMLAudioElement>(null);
   const [capability, setCapability] = useState<Capability | null>(null);
   useEffect(() => {
     if (type !== "cloned") return;
@@ -1023,10 +1041,10 @@ export function NarrationPicker({
     setLoading(true);
     setError("");
     try {
-      const d = await api<{ voices: string[]; default: string }>(
+      const d = await api<{ speakers: PresetVoice[]; default: string }>(
         "/voices/presets",
       );
-      setPresets(d.voices);
+      setPresets(d.speakers);
       setPreset(d.default);
     } catch (e) {
       setError((e as Error).message);
@@ -1038,6 +1056,7 @@ export function NarrationPicker({
     v.name.toLowerCase().includes(query.toLowerCase()),
   );
   const chosen = voices.find((v) => v.id === selected);
+  const presetVoice = presets.find((v) => v.id === preset);
   return (
     <div className="narration-picker">
       <div
@@ -1070,14 +1089,47 @@ export function NarrationPicker({
             <select
               aria-label="Narration voice"
               value={preset}
-              onChange={(e) => setPreset(e.target.value)}
+              onChange={(e) => {
+                const value = e.target.value;
+                setPreset(value);
+                void post("/voices/preferences", {
+                  preset_voice_id: value,
+                }).catch((error) => setError(error.message));
+              }}
             >
               {presets.map((v) => (
-                <option key={v} value={v}>
-                  {v.replaceAll("_", " ")}
+                <option key={v.id} value={v.id}>
+                  {v.name} · {v.description}
                 </option>
               ))}
             </select>
+          )}
+          {presets.length > 0 && (
+            <button
+              className="button secondary"
+              disabled={!presetVoice?.preview_url}
+              onClick={() => {
+                const player = previewPlayer.current;
+                if (!player) return;
+                player.currentTime = 0;
+                void player.play();
+              }}
+            >
+              <PlayIcon />
+              {presetVoice?.preview_url
+                ? "Preview voice"
+                : "Preview unavailable"}
+            </button>
+          )}
+          {presetVoice?.preview_url && (
+            <audio
+              key={presetVoice.id}
+              ref={previewPlayer}
+              controls
+              preload="auto"
+              aria-label="Preset voice preview"
+              src={presetVoice.preview_url}
+            />
           )}
           <button
             className="button"
@@ -1139,6 +1191,7 @@ export function NarrationPicker({
                   {filtered.length === 0 && <p>No matching voices.</p>}
                   {chosen?.has_preview && (
                     <audio
+                      key={chosen.id}
                       controls
                       aria-label="Selected cloned voice preview"
                       src={`/api/voices/${chosen.id}/preview`}

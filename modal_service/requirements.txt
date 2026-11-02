@@ -1,3 +1,6 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.10.0+cu128
+torchaudio==2.10.0+cu128
 faster-qwen3-tts==0.5.4
 qwen-tts-hf==0.1.1.post1
 transformers==5.15.1
@@ -6,5 +9,3 @@ soundfile==0.14.0
 numpy==2.5.4
 huggingface-hub==1.33.0
 hf-xet==1.8.0
-SQLAlchemy==2.1.6
-pydantic-settings==2.16.2

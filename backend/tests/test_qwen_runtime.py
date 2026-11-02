@@ -2,8 +2,9 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 import sys
 import pytest
-from backend.qwen_runtime import QwenEngine, LocalTTSError
-from backend.qwen_worker import single_gpu_worker
+from backend.speech_contract import LocalTTSError
+from backend.tts_worker import single_tts_worker
+from modal_service.inference import QwenEngine
 
 
 def test_cuda_unavailable_is_honest(monkeypatch, tmp_path):
@@ -72,30 +73,28 @@ def test_real_runtime_oom_handler_frees_conditioning_and_reports_retry(monkeypat
     )
     engine = QwenEngine.__new__(QwenEngine)
     engine.torch = SimpleNamespace(cuda=cuda, inference_mode=nullcontext)
-    engine.references = {}
+    engine.model_id = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
     engine.cuda_graphs = True
 
     def fail(**kwargs):
         raise OOM()
 
-    engine.model = SimpleNamespace(generate_voice_clone_streaming=fail, _voice_prompt_cache={})
+    engine.model = SimpleNamespace(generate_custom_voice=fail, _voice_prompt_cache={})
     monkeypatch.setitem(sys.modules, "numpy", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "soundfile", SimpleNamespace())
     reference = tmp_path / "reference.wav"
     reference.write_bytes(b"test")
     with pytest.raises(LocalTTSError, match="ran out of memory"):
-        engine.generate("voice", reference, "Reference text", "Target text", "en", tmp_path / "audio.wav")
+        engine.synthesize("Target text", "en", speaker="Aiden")
     assert freed == [True] and not engine.cuda_graphs
     with pytest.raises(LocalTTSError, match="language"):
-        engine.generate(
-            "voice", reference, "Reference text", "Target text", "unsupported", tmp_path / "audio.wav"
-        )
+        engine.synthesize("Target text", "unsupported", reference=reference, ref_text="Reference text")
 
 
-def test_only_one_gpu_worker_can_hold_process_lock():
-    with single_gpu_worker():
+def test_only_one_speech_worker_can_hold_process_lock():
+    with single_tts_worker():
         with pytest.raises(OSError):
-            with single_gpu_worker():
+            with single_tts_worker():
                 pass
 
 
@@ -116,11 +115,8 @@ def test_graph_capture_failure_never_enables_fallback():
 @pytest.mark.parametrize(
     "values",
     [
-        {"qwen_tts_cuda_graphs": False},
-        {"qwen_tts_device": "cpu"},
         {"qwen_tts_model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base"},
-        {"qwen_tts_max_concurrent_jobs": 2},
-        {"qwen_tts_stream_chunk_size": 0},
+        {"qwen_tts_chunk_chars": 0},
     ],
 )
 def test_unsupported_configurations_rejected(values):

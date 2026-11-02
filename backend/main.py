@@ -4,7 +4,7 @@ import shutil
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from argon2.exceptions import VerificationError
+from typing import Literal
 from google.auth.exceptions import GoogleAuthError
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +17,15 @@ from starlette.middleware.sessions import SessionMiddleware
 from .config import settings
 from .google_identity import verify_google_token
 from .analytics import router as analytics_router, user_meetings, user_stats
+from .admin import (
+    router as admin_router,
+    AdminLogin,
+    login as password_login,
+    approve,
+    overview as admin_overview,
+)
 from .money import usd
+from . import summaries
 from .jobs import ACTIVE, enqueue, latest
 from .media import EXTENSIONS, MIMES, probe, safe_path, signature_ok
 from .limits import BodyLimitMiddleware
@@ -27,12 +35,11 @@ from .schema import Minutes, SpeechRequest, SummaryRequest, spoken_text
 from .voices import router as voices_router, owned as owned_voice, lock_user
 from .security import (
     admin_user,
-    current_session,
+    logout_session,
     current_user,
     digest,
     origin_check,
     owns,
-    passwords,
     rate_limit,
     start_session,
 )
@@ -51,7 +58,10 @@ async def lifespan(app):
 app = FastAPI(title="SUMX", lifespan=lifespan)
 app.include_router(analytics_router)
 app.include_router(voices_router)
-app.add_middleware(BodyLimitMiddleware, limit=(settings.max_upload_mb + 1) * 1024 * 1024)
+app.include_router(admin_router)
+app.add_middleware(
+    BodyLimitMiddleware, limit=(settings.max_upload_mb + 1) * 1024 * 1024 if settings.max_upload_mb else None
+)
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.session_secret or secrets.token_hex(32),
@@ -71,7 +81,8 @@ app.add_middleware(
 @app.middleware("http")
 async def security_headers(request, call_next):
     if (
-        request.headers.get("content-length", "").isdigit()
+        settings.max_upload_mb > 0
+        and request.headers.get("content-length", "").isdigit()
         and int(request.headers["content-length"]) > (settings.max_upload_mb + 1) * 1024 * 1024
     ):
         return JSONResponse({"detail": "Upload exceeds the server limit"}, status_code=413)
@@ -81,10 +92,11 @@ async def security_headers(request, call_next):
             "X-Content-Type-Options": "nosniff",
             "Referrer-Policy": "same-origin",
             "X-Frame-Options": "DENY",
-            "Cache-Control": "no-store",
             "Permissions-Policy": "camera=(), microphone=(self)",
         }
     )
+    # Only versioned preset previews opt in to caching; everything else stays uncached.
+    response.headers.setdefault("Cache-Control", "no-store")
     return response
 
 
@@ -106,6 +118,8 @@ def me(request: Request, user=Depends(current_user)):
         "name": user.name,
         "role": user.role,
         "csrf": request.state.session.csrf,
+        "auth_method": request.state.session.auth_method,
+        "admin_id": user.admin_id,
     }
 
 
@@ -169,9 +183,17 @@ def google_login(body: GoogleCredential, request: Request, db: DBSession = Depen
     if user and user.role == "admin":
         raise HTTPException(403, "Administrators must use the separate admin login.")
     if not user:
-        user = User(email=email, name=str(info.get("name") or email)[:200])
+        user = User(id=allowed.id, email=email, name=str(info.get("name") or email)[:200])
         db.add(user)
     user.email, user.google_sub = email, subject
+    user.name = str(info.get("name") or email)[:200]
+    picture = info.get("picture")
+    user.picture = (
+        picture
+        if isinstance(picture, str) and picture.startswith("https://") and len(picture) <= 2048
+        else None
+    )
+    user.last_login = time.time()
     try:
         db.flush()
     except IntegrityError:
@@ -181,7 +203,7 @@ def google_login(body: GoogleCredential, request: Request, db: DBSession = Depen
     if old:
         db.delete(old)
     response = JSONResponse({"ok": True})
-    start_session(db, user, response)
+    start_session(db, user, response, "google")
     request.session.clear()
     return response
 
@@ -193,29 +215,11 @@ class Login(BaseModel):
 
 @app.post("/api/auth/admin/login")
 def admin_login(body: Login, request: Request, db: DBSession = Depends(get_db)):
-    origin_check(request)
-    rate_limit(db, "login-ip:" + request.client.host, 10, 900)
-    rate_limit(db, "login-email:" + body.email.lower(), 8, 900)
-    user = db.scalar(select(User).where(User.email == body.email.lower(), User.role == "admin"))
-    # Always perform a password verification, including unknown email addresses.
-    password_hash = (
-        user.password_hash
-        if user and user.password_hash
-        else "$argon2id$v=19$m=65536,t=3,p=4$c3VteC1ub25leGlzdGVudA$7yCx3zrI4Bg6zOqS1FRZ7wMzmiGZW2Vc8jPqwENr8YU"
-    )
-    try:
-        passwords.verify(password_hash, body.password)
-        if not user:
-            raise VerificationError()
-    except VerificationError:
-        raise HTTPException(401, "Email or password is incorrect")
-    response = JSONResponse({"ok": True})
-    start_session(db, user, response)
-    return response
+    return password_login(AdminLogin(admin_id=body.email, password=body.password), request, db)
 
 
 @app.post("/api/auth/logout")
-def logout(request: Request, session=Depends(current_session), db: DBSession = Depends(get_db)):
+def logout(request: Request, session=Depends(logout_session), db: DBSession = Depends(get_db)):
     db.delete(session)
     db.commit()
     request.session.clear()
@@ -235,7 +239,7 @@ def config(user=Depends(current_user)):
             "tts": settings.openrouter_tts_model,
             "cloning": settings.qwen_tts_model,
         },
-        "default_voice": settings.openrouter_tts_voice,
+        "default_voice": settings.tts_default_voice,
         "ai_configured": bool(settings.openrouter_api_key),
     }
 
@@ -350,7 +354,7 @@ def upload(
         with path.open("wb") as target:
             while chunk := file.file.read(1024 * 1024):
                 size += len(chunk)
-                if size > settings.max_upload_mb * 1024 * 1024:
+                if settings.max_upload_mb and size > settings.max_upload_mb * 1024 * 1024:
                     raise HTTPException(413, "File exceeds the server upload limit")
                 target.write(chunk)
         if not signature_ok(path):
@@ -479,6 +483,44 @@ def transcribe(
     return queue_operation(db, user, meeting_id, "transcribe", key, {})
 
 
+SummaryMode = Literal["concise", "standard", "detailed"]
+
+
+@app.get("/api/meetings/{meeting_id}/summaries")
+def list_summaries(meeting_id: str, user=Depends(current_user), db: DBSession = Depends(get_db)):
+    owns(db, Meeting, meeting_id, user)
+    return summaries.overview(db, meeting_id)
+
+
+@app.get("/api/meetings/{meeting_id}/summaries/{mode}")
+def mode_summary(
+    meeting_id: str, mode: SummaryMode, user=Depends(current_user), db: DBSession = Depends(get_db)
+):
+    owns(db, Meeting, meeting_id, user)
+    return summaries.full_record(db, meeting_id, mode)
+
+
+@app.post("/api/meetings/{meeting_id}/summaries/{mode}/generate")
+def generate_summary(
+    meeting_id: str,
+    mode: SummaryMode,
+    key: str = Header(..., alias="Idempotency-Key"),
+    user=Depends(current_user),
+    db: DBSession = Depends(get_db),
+):
+    owns(db, Meeting, meeting_id, user)
+    running = db.scalar(select(Job).where(Job.meeting_id == meeting_id, Job.state.in_(ACTIVE)))
+    if running and not (running.kind == "summarize" and running.payload.get("detail") == mode):
+        raise HTTPException(409, "This meeting is busy. Try again when the current task finishes.")
+    return queue_operation(db, user, meeting_id, "summarize", key, {"detail": mode})
+
+
+@app.get("/api/meetings/{meeting_id}/narration-options")
+def narration_options(meeting_id: str, user=Depends(current_user), db: DBSession = Depends(get_db)):
+    owns(db, Meeting, meeting_id, user)
+    return {"options": summaries.overview(db, meeting_id)["narration_options"]}
+
+
 @app.post("/api/meetings/{meeting_id}/summarize")
 def summarize(
     meeting_id: str,
@@ -490,6 +532,7 @@ def summarize(
     return queue_operation(db, user, meeting_id, "summarize", key, body.model_dump())
 
 
+@app.post("/api/meetings/{meeting_id}/narrations")
 @app.post("/api/meetings/{meeting_id}/speech")
 def speech(
     meeting_id: str,
@@ -499,13 +542,22 @@ def speech(
     db: DBSession = Depends(get_db),
 ):
     meeting = owns(db, Meeting, meeting_id, user)
+    from .speech_contract import PIPELINE_VERSION, LocalTTSError
+    from .voice_catalog import default_preset, preset_id
+
     if body.voice_type == "cloned":
         rate_limit(db, "ai:" + user.id, 30, 3600)
         if not 16 <= len(key) <= 100:
             raise HTTPException(422, "Invalid retry key")
         lock_user(db, user.id)
         voice = owned_voice(db, body.cloned_voice_id, user)
-        if not voice.saved or not voice.preview_path or not voice.consent_at:
+        if (
+            not voice.saved
+            or not voice.preview_path
+            or not voice.consent_at
+            or voice.preview_version != PIPELINE_VERSION
+            or not voice.reference_verified_at
+        ):
             raise HTTPException(409, "Generate a preview and save this voice before using it")
         if not voice.reference_text.strip():
             raise HTTPException(409, "This voice needs its matching reference transcript")
@@ -516,7 +568,18 @@ def speech(
         if not meeting.summary_version:
             raise HTTPException(409, "Create a summary first")
     payload = body.model_dump()
+    if body.voice_type == "preset":
+        try:
+            payload["preset_voice_id"] = preset_id(body.preset_voice_id or body.voice or default_preset(user))
+        except LocalTTSError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    # A named mode narrates that saved summary; older clients get the newest one.
     payload["summary_version"] = meeting.summary_version
+    if body.summary_mode:
+        chosen = summaries.active_summary(db, meeting.id, body.summary_mode)
+        if not chosen:
+            raise HTTPException(409, f"No {body.summary_mode} summary has been generated")
+        payload["summary_version"] = chosen.version
     if body.voice_type == "cloned":
         return job_info(enqueue(db, meeting, "speech", key, payload))
     return queue_operation(db, user, meeting_id, "speech", key, payload)
@@ -559,6 +622,7 @@ def narration_status(job_id: str, user=Depends(current_user), db: DBSession = De
         raise HTTPException(404, "Narration job not found")
     meeting = owns(db, Meeting, job.meeting_id, user)
     worker = db.get(LocalTTSWorker, "qwen3")
+    cloned = job.payload.get("voice_type") == "cloned"
     local = db.scalar(
         select(LocalTTSGeneration)
         .where(LocalTTSGeneration.parent_job_id == job.id)
@@ -596,9 +660,9 @@ def narration_status(job_id: str, user=Depends(current_user), db: DBSession = De
         "started_at": job.started_at,
         "completed_at": job.completed_at,
         "error": job.error,
-        "engine": "Faster Qwen3-TTS" if job.payload.get("voice_type") == "cloned" else "OpenRouter preset",
-        "gpu_name": worker.gpu_name if worker and job.payload.get("voice_type") == "cloned" else None,
-        "cuda_graphs": bool(worker and worker.cuda_graphs),
+        "engine": "Faster Qwen3-TTS" if cloned else "Voxtral TTS 3",
+        "gpu_name": worker.gpu_name if worker and cloned else None,
+        "cuda_graphs": bool(worker and cloned and worker.cuda_graphs),
         "audio_ready": job.state == "completed" and bool(job.output_path),
     }
 
@@ -653,9 +717,10 @@ def edit_summary(
 ):
     m = owns(db, Meeting, meeting_id, user)
     idle(db, m.id)
-    if m.summary_version != body.version:
+    previous = db.scalar(select(Summary).where(Summary.meeting_id == m.id, Summary.version == body.version))
+    # Only the active summary of its own mode can be edited, whatever other modes have done.
+    if not previous or body.version not in summaries.active_versions(db, m.id):
         raise HTTPException(409, "Summary changed. Reload before editing.")
-    previous = latest(db, Summary, m.id)
     m.summary_version += 1
     db.add(
         Summary(
@@ -663,6 +728,7 @@ def edit_summary(
             version=m.summary_version,
             transcript_version=previous.transcript_version,
             content=body.content.model_dump(),
+            detail=previous.detail,
         )
     )
     db.execute(delete(Job).where(Job.meeting_id == m.id, Job.state == "failed"))
@@ -672,10 +738,17 @@ def edit_summary(
 
 @app.get("/api/meetings/{meeting_id}/export")
 def export(
-    meeting_id: str, kind: str = "summary", user=Depends(current_user), db: DBSession = Depends(get_db)
+    meeting_id: str,
+    kind: str = "summary",
+    mode: SummaryMode | None = None,
+    user=Depends(current_user),
+    db: DBSession = Depends(get_db),
 ):
     owns(db, Meeting, meeting_id, user)
-    obj = latest(db, Transcript if kind == "transcript" else Summary, meeting_id)
+    if kind == "summary" and mode:
+        obj = summaries.active_summary(db, meeting_id, mode)
+    else:
+        obj = latest(db, Transcript if kind == "transcript" else Summary, meeting_id)
     if not obj:
         raise HTTPException(404, "Requested content is not available")
     content = obj.text if kind == "transcript" else spoken_text(obj.content)
@@ -711,7 +784,7 @@ def audio(
 ):
     m = owns(db, Meeting, meeting_id, user)
     a = db.get(AudioOutput, audio_id)
-    if not a or a.meeting_id != m.id or a.summary_version != m.summary_version:
+    if not a or a.meeting_id != m.id or a.summary_version not in summaries.active_versions(db, m.id):
         raise HTTPException(404, "Narration for the current summary is not available")
     return FileResponse(
         safe_path(a.path),
@@ -724,14 +797,13 @@ def audio(
 @app.get("/api/preset-voices")
 def voices(user=Depends(current_user), db: DBSession = Depends(get_db)):
     rate_limit(db, "voices:" + user.id, 30, 3600)
-    provider = OpenRouter()
-    try:
-        return {"voices": provider.voices(), "default": settings.openrouter_tts_voice}
-    finally:
-        provider.close()
+    from .preset_voices import PRESETS
+    from .voice_catalog import default_preset
+
+    return {"voices": list(PRESETS), "default": default_preset(user)}
 
 
-@app.get("/api/admin/users")
+@app.get("/api/admin/allowed-users", deprecated=True)
 def allowed_users(user=Depends(admin_user), db: DBSession = Depends(get_db)):
     return [
         {"email": a.email, "active": a.active}
@@ -746,86 +818,19 @@ class AllowedEdit(BaseModel):
 
 @app.post("/api/admin/users")
 def allow_user(body: AllowedEdit, user=Depends(admin_user), db: DBSession = Depends(get_db)):
-    email = body.email.strip().lower()
-    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
-        raise HTTPException(422, "Enter a valid email address")
-    allowed = db.get(AllowedEmail, email)
-    if not allowed:
-        allowed = AllowedEmail(email=email)
-        db.add(allowed)
-    allowed.active = body.active
-    db.commit()
-    return {"email": email, "active": allowed.active}
+    result = approve(db, user, body.email, body.active)
+    return {"email": result["email"], "active": result["active"]}
 
 
 @app.delete("/api/admin/users/{email}")
 def remove_user(email: str, user=Depends(admin_user), db: DBSession = Depends(get_db)):
-    db.execute(delete(AllowedEmail).where(AllowedEmail.email == email.lower()))
-    db.commit()
+    approve(db, user, email, active=False)
     return {"ok": True}
 
 
-@app.get("/api/admin/analytics")
+@app.get("/api/admin/analytics", deprecated=True)
 def analytics(user=Depends(admin_user), db: DBSession = Depends(get_db)):
-    users = db.scalars(select(User)).all()
-    meetings = db.scalars(select(Meeting)).all()
-    usage = db.scalars(select(Usage).where(Usage.excluded_as_duplicate.is_(False))).all()
-    jobs = db.scalars(select(Job).order_by(Job.created.desc()).limit(50)).all()
-
-    def costs(rows):
-        return {
-            "reported_cost": sum(u.cost or 0 for u in rows if u.cost_status == "actual"),
-            "unknown_requests": sum(u.cost is None or u.cost_status != "actual" for u in rows),
-            "requests": len(rows),
-        }
-
-    participants = []
-    for u in users:
-        ms = [m for m in meetings if m.user_id == u.id]
-        cs = costs([r for r in usage if r.user_id == u.id])
-        meeting_cs = costs([r for r in usage if r.user_id == u.id and r.meeting_id is not None])
-        participants.append(
-            {
-                "email": u.email,
-                "meetings": len(ms),
-                "minutes": sum(m.duration for m in ms) / 60,
-                **cs,
-                "cost_per_meeting": meeting_cs["reported_cost"] / len(ms)
-                if ms and not meeting_cs["unknown_requests"]
-                else None,
-            }
-        )
-    days = {}
-    for u in usage:
-        day = time.strftime("%Y-%m-%d", time.gmtime(u.created))
-        days.setdefault(day, []).append(u)
-    return {
-        "totals": costs(usage),
-        "participants": participants,
-        "operations": {op: costs([u for u in usage if u.operation == op]) for op in ("stt", "llm", "tts")},
-        "models": [
-            {"model": model, **costs([u for u in usage if u.model == model])}
-            for model in sorted({u.model for u in usage})
-        ],
-        "trends": [{"day": day, **costs(rows)} for day, rows in sorted(days.items())],
-        "recent_jobs": [job_info(j) for j in jobs],
-        "usage": [
-            {
-                k: getattr(u, k)
-                for k in [
-                    "id",
-                    "operation",
-                    "model",
-                    "generation_id",
-                    "request_id",
-                    "cost",
-                    "cost_source",
-                    "created",
-                ]
-            }
-            for u in sorted(usage, key=lambda r: r.created, reverse=True)[:50]
-        ],
-    }
+    return admin_overview(days=0, user=user, db=db)
 
 
 @app.post("/api/admin/usage/reconcile")

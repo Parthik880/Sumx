@@ -28,7 +28,9 @@ test("official GIS API contract, access denial, popup callback login, switch and
     (window as any).testGoogleEmail = "unapproved@college.edu";
   });
   await page.getByRole("button", { name: "Continue with Google" }).click();
-  await expect(page.getByRole("alert")).toContainText("Access denied");
+  await expect(page).toHaveURL(/\/\?message=/);
+  await expect(page.getByRole("status")).toContainText("Access denied");
+  await page.getByRole("link", { name: "Sign in", exact: true }).click();
   await expect(
     page.getByRole("button", { name: "Continue with Google" }),
   ).toBeVisible();

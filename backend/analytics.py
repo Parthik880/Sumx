@@ -283,8 +283,18 @@ def local_metrics(db, days):
     data = dict(db.execute(q).mappings().one())
     return {
         **{k: v or 0 for k, v in data.items()},
-        "provider": "local_qwen3",
-        "external_api_cost_usd": "0",
+        "provider": "modal_qwen3",
+        "external_api_cost_usd": format(
+            sum(
+                db.scalars(
+                    select(LocalTTSGeneration.external_api_cost).where(
+                        LocalTTSGeneration.created >= start, LocalTTSGeneration.created <= end
+                    )
+                ),
+                Decimal(0),
+            ).normalize(),
+            "f",
+        ),
         "models": list(
             db.scalars(
                 select(LocalTTSGeneration.model)
@@ -404,7 +414,9 @@ def admin_costs(
             {"model": model, "cost": cost}
             for model, cost in grouped(db, Usage.model, *period_scope(days)).items()
         ],
-        "preview_cost": cost_total(db, Usage.purpose == "voice_preview", *period_scope(days)),
+        "preview_cost": cost_total(
+            db, Usage.purpose.in_(("voice_preview", "preset_preview")), *period_scope(days)
+        ),
         "local_tts": local_metrics(db, days),
     }
 
@@ -494,7 +506,11 @@ def export_costs(days: Days = 30, user=Depends(admin_user), db: Session = Depend
                 safe(name),
                 safe(email),
                 safe(usage.meeting_id),
-                safe("Voice preview" if usage.purpose == "voice_preview" else title or "Deleted meeting"),
+                safe(
+                    "Voice preview"
+                    if usage.purpose in ("voice_preview", "preset_preview")
+                    else title or "Deleted meeting"
+                ),
                 safe(usage.operation),
                 safe(usage.model),
                 safe(usage.generation_id),

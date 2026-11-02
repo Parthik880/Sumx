@@ -4,6 +4,8 @@ export type User = {
   email: string;
   role: string;
   csrf: string;
+  auth_method: string;
+  admin_id: string | null;
 };
 export type Action = {
   task: string;
@@ -28,6 +30,26 @@ export type Job = {
   completed: number;
   total: number;
   error: string | null;
+};
+export type SummaryMode = "concise" | "standard" | "detailed";
+export type SummaryInfo = {
+  mode: SummaryMode;
+  exists: boolean;
+  status: "not_generated" | "generating" | "generated" | "failed";
+  error: string | null;
+  version?: number;
+  transcript_version?: number;
+  audio_count?: number;
+};
+export type SummaryRecord = SummaryInfo & {
+  content?: Minutes;
+  audio?: NonNullable<Meeting["audio"]>;
+};
+export type SummaryOverview = {
+  modes: Record<SummaryMode, SummaryInfo>;
+  latest_mode: SummaryMode | null;
+  narration_options: SummaryMode[];
+  legacy: { id: string; version: number; content: Minutes } | null;
 };
 export type Meeting = {
   id: string;
@@ -65,6 +87,29 @@ export type Config = {
   models: { stt: string; summary: string; tts: string; cloning: string };
 };
 let csrf = "";
+type AuthFailure = "access_revoked" | "session_required";
+let authFailureHandler: ((reason: AuthFailure) => void) | null = null;
+export function setAuthFailureHandler(handler: typeof authFailureHandler) {
+  authFailureHandler = handler;
+}
+function sessionFailure(code: string | null, requestCsrf: string) {
+  // An old request must not sign out a newer session after an account switch.
+  if (
+    requestCsrf === csrf &&
+    (code === "access_revoked" || code === "session_required")
+  ) {
+    authFailureHandler?.(code);
+  }
+}
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+    public retryAfter?: number,
+  ) {
+    super(message);
+  }
+}
 export function setCsrf(value: string) {
   csrf = value;
 }
@@ -72,6 +117,7 @@ export async function api<T = any>(
   path: string,
   options: RequestInit = {},
 ): Promise<T> {
+  const requestCsrf = csrf;
   const response = await fetch("/api" + path, {
     ...options,
     credentials: "include",
@@ -84,11 +130,14 @@ export async function api<T = any>(
     },
   });
   if (!response.ok) {
+    sessionFailure(response.headers.get("X-SUMX-Auth-Error"), requestCsrf);
     const body = await response.json().catch(() => ({}));
-    throw new Error(
+    throw new ApiError(
       typeof body.detail === "string"
         ? body.detail
         : `Request failed (${response.status})`,
+      response.status,
+      Number(response.headers.get("Retry-After")) || undefined,
     );
   }
   return response.json();
@@ -107,6 +156,7 @@ export function upload(
   progress: (percent: number) => void,
 ): Promise<Meeting> {
   return new Promise((resolve, reject) => {
+    const requestCsrf = csrf;
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/meetings/" + (recording ? "recordings" : "upload"));
     xhr.withCredentials = true;
@@ -130,12 +180,14 @@ export function upload(
         return;
       }
       if (xhr.status >= 200 && xhr.status < 300) resolve(body);
-      else
+      else {
+        sessionFailure(xhr.getResponseHeader("X-SUMX-Auth-Error"), requestCsrf);
         reject(
           new Error(
             typeof body.detail === "string" ? body.detail : "Upload failed",
           ),
         );
+      }
     };
     xhr.send(data);
   });

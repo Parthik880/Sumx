@@ -159,17 +159,17 @@ test("unavailable cloning capability keeps presets available", async ({
   await page.route("**/api/voices/capabilities", (route) =>
     route.fulfill({
       json: {
-        model: "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        model: "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
         supported: false,
         state: "offline",
         gpu_available: false,
-        message: "The local GPU voice worker is unavailable.",
+        message: "The GPU voice service is unavailable.",
       },
     }),
   );
   await page.goto("/voices/new");
   await expect(
-    page.getByText("The local GPU voice worker is unavailable."),
+    page.getByText("The GPU voice service is unavailable."),
   ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Generate Voice Preview", exact: true }),
@@ -184,4 +184,76 @@ test("unavailable cloning capability keeps presets available", async ({
   await expect(
     page.getByRole("button", { name: "Load available voices" }),
   ).toBeEnabled();
+});
+
+test("stored preset previews play with no inference call and switching stops playback", async ({
+  page,
+  context,
+}) => {
+  await context.addCookies([
+    {
+      name: "sumx_session",
+      value: "voice-browser-token",
+      domain: "localhost",
+      path: "/",
+    },
+  ]);
+  const generation: string[] = [];
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      /\/preview|\/speech|\/narrate/.test(request.url())
+    )
+      generation.push(request.url());
+  });
+  await page.goto("/history");
+  await page
+    .getByRole("link", { name: "Voice studio meeting", exact: true })
+    .click();
+  await page.getByRole("tab", { name: "Recording & narration" }).click();
+  await page.getByRole("button", { name: "Load available voices" }).click();
+  const select = page.getByLabel("Narration voice", { exact: true });
+  await expect(select).toHaveValue("en_paul_neutral");
+  expect(
+    await select
+      .locator("option")
+      .evaluateAll((options) =>
+        options.map((option) => (option as HTMLOptionElement).value),
+      ),
+  ).toEqual([
+    "en_paul_neutral",
+    "en_paul_confident",
+    "gb_oliver_neutral",
+    "gb_oliver_confident",
+    "gb_jane_neutral",
+    "gb_jane_confident",
+  ]);
+  await select.selectOption("gb_oliver_neutral");
+  const audio = page.getByLabel("Preset voice preview");
+  await expect(audio).toHaveAttribute("src", /gb_oliver_neutral/);
+  await expect
+    .poll(() => audio.evaluate((element: HTMLAudioElement) => element.duration))
+    .toBeGreaterThan(0);
+  const preview = page.getByRole("button", {
+    name: "Preview voice",
+    exact: true,
+  });
+  await preview.click();
+  await preview.click();
+  await select.selectOption("gb_jane_neutral");
+  await expect(audio).toHaveAttribute("src", /gb_jane_neutral/);
+  expect(await audio.evaluate((e: HTMLAudioElement) => e.paused)).toBe(true);
+  // The last preset deliberately has no stored file.
+  await select.selectOption("gb_jane_confident");
+  await expect(
+    page.getByRole("button", { name: "Preview unavailable" }),
+  ).toBeDisabled();
+  await expect(audio).toHaveCount(0);
+  expect(generation).toEqual([]);
+  await page.reload();
+  await page.getByRole("tab", { name: "Recording & narration" }).click();
+  await page.getByRole("button", { name: "Load available voices" }).click();
+  await expect(select).toHaveValue("gb_jane_confident");
+  // Leave the shared browser fixture at its default for other workflow tests.
+  await select.selectOption("en_paul_neutral");
 });

@@ -8,6 +8,7 @@ os.environ["DATABASE_URL"] = "sqlite:///" + (TEST_ROOT / "test.db").as_posix()
 os.environ["STORAGE_DIR"] = str(TEST_ROOT / "media")
 os.environ["SESSION_SECRET"] = "test-session-secret-with-at-least-32-characters"
 os.environ["COOKIE_SECURE"] = "false"
+os.environ["MAX_UPLOAD_MB"] = "0"
 os.environ["OPENROUTER_API_KEY"] = "test-not-a-real-key"
 os.environ["GOOGLE_CLIENT_ID"] = "test-client.apps.googleusercontent.com"
 
@@ -22,6 +23,64 @@ def database():
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     yield
+
+
+@pytest.fixture(autouse=True)
+def speech_fixtures(monkeypatch):
+    """Keep normal unit tests offline; focused verifier/runtime tests exercise real guards."""
+    import time
+    from backend import reference_quality, tts_queue, tts_worker
+    from backend.models import LocalTTSWorker, LocalTTSGeneration
+    from backend.tests.qwen_mock import MockQwenEngine
+    from pathlib import Path
+
+    def verified(db, voice):
+        voice.reference_verified_at = time.time()
+        db.commit()
+        return {}
+
+    monkeypatch.setattr(reference_quality, "verify_reference", verified)
+
+    def generate(voice, text, key, meeting_id=None, timeout=1800, progress=None, raw_wav=False, **options):
+        with DB() as db:
+            if not db.get(LocalTTSWorker, "qwen3"):
+                from backend.config import settings
+
+                db.add(LocalTTSWorker(id="qwen3", state="ready", model=settings.qwen_tts_model))
+                db.commit()
+            tid = tts_queue.submit(db, voice, text, key, meeting_id, **options).id
+        tts_worker.process(tid, MockQwenEngine())
+        with DB() as db:
+            row = db.get(LocalTTSGeneration, tid)
+            if progress:
+                progress(row)
+            if row.state != "completed":
+                raise ValueError(row.error)
+            output = Path(row.output_path)
+            return (output.with_suffix(".wav") if raw_wav else output).read_bytes()
+
+    monkeypatch.setattr(tts_queue, "generate", generate)
+    MockQwenEngine.generated.clear()
+    MockQwenEngine.fail_once.clear()
+
+    def generate_narration(voice, chunks, job_id, meeting_id, folder, *, progress=None, **options):
+        with DB() as db:
+            if not db.get(LocalTTSWorker, "qwen3"):
+                from backend.config import settings
+
+                db.add(LocalTTSWorker(id="qwen3", state="ready", model=settings.qwen_tts_model))
+                db.commit()
+            tid = tts_queue.submit_narration(db, voice, chunks, job_id, meeting_id, folder, **options).id
+        tts_worker.process_narration(tid, MockQwenEngine())
+        with DB() as db:
+            row = db.get(LocalTTSGeneration, tid)
+            if progress:
+                progress(row)
+            if row.state != "completed":
+                raise ValueError(row.error)
+            return Path(row.output_path)
+
+    monkeypatch.setattr(tts_queue, "generate_narration", generate_narration)
 
 
 @pytest.fixture

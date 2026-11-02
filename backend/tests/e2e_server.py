@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import subprocess
 import os
 import tempfile
 import threading
@@ -13,6 +14,7 @@ os.environ.update(
     STORAGE_DIR=str(root / "media"),
     SESSION_SECRET="browser-test-secret-with-at-least-32-characters",
     COOKIE_SECURE="false",
+    MAX_UPLOAD_MB="0",
     APP_URL="http://localhost:5174",
     OPENROUTER_API_KEY="test-only-not-a-real-key",
     GOOGLE_CLIENT_ID="test-client.apps.googleusercontent.com",
@@ -20,14 +22,43 @@ os.environ.update(
 
 import httpx
 import uvicorn
-from backend import jobs, main, voices, qwen_worker
+from backend import jobs, main, tts_worker, reference_quality
 from backend.tests.qwen_mock import MockQwenEngine
-from backend.models import AllowedEmail, Base, DB, Session, User, Meeting, Summary, Usage, engine
+from backend.models import AllowedEmail, Base, DB, Session, User, Meeting, Summary, Usage, engine, Transcript
 from backend.provider import OpenRouter
+from backend.preset_voices import PRESETS
 from backend.tests.test_sumx import MINUTES
+from backend.voice_catalog import preview_file
+from backend.security import passwords
+
+
+revisions = {}
+
+
+def sample_mp3():
+    return subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=330:duration=1",
+            "-f",
+            "mp3",
+            "pipe:1",
+        ],
+        capture_output=True,
+        check=True,
+    ).stdout
 
 
 def handler(request):
+    if request.url.path.endswith("/audio/speech"):
+        return httpx.Response(200, content=sample_mp3(), headers={"content-type": "audio/mpeg"})
+    if request.url.path.endswith("/models"):
+        return httpx.Response(200, json={"data": []})
     if request.url.path.endswith("transcriptions"):
         return httpx.Response(
             200,
@@ -39,58 +70,52 @@ def handler(request):
             },
         )
     if request.url.path.endswith("completions"):
+        messages = json.loads(request.content)["messages"]
+        content = MINUTES
+        mode = "shared"
+        if "We reviewed the plan." in str(messages):
+            mode = next(m for m in ("concise", "standard", "detailed") if m.upper() + ":" in messages[0]["content"])
+            content = {**MINUTES, "executive_summary": f"{mode} revision {revisions.get(mode, 0) + 1}"}
+        revisions[mode] = revisions.get(mode, 0) + 1
         return httpx.Response(
             200,
             json={
-                "id": "browser-test-generation",
-                "choices": [{"message": {"content": json.dumps(MINUTES)}}],
+                "id": f"browser-test-generation-{mode}-{revisions[mode]}",
+                "choices": [{"message": {"content": json.dumps(content)}}],
                 "usage": {"cost": 0.0001},
-            },
-        )
-    if request.url.path.endswith("models"):
-        return httpx.Response(
-            200,
-            json={
-                "data": [
-                    {
-                        "id": os.environ.get("OPENROUTER_TTS_MODEL", "mistralai/voxtral-mini-tts-2603"),
-                        "supported_voices": ["en_paul_neutral"],
-                    }
-                ]
-            },
-        )
-    if request.url.path.endswith("speech"):
-        import subprocess
-
-        audio = subprocess.run(
-            [
-                "ffmpeg",
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=0.3",
-                "-f",
-                "mp3",
-                "pipe:1",
-            ],
-            capture_output=True,
-            check=True,
-        ).stdout
-        return httpx.Response(
-            200,
-            content=audio,
-            headers={
-                "Content-Type": "audio/mpeg",
-                "X-Generation-Id": "test-tts-" + __import__("uuid").uuid4().hex,
             },
         )
     return httpx.Response(400, json={"error": "Unexpected test request"})
 
 
+def store_previews():
+    """Every preset has a preview except the last, which covers the unavailable state."""
+    for voice in list(PRESETS)[:-1]:
+        target = preview_file(voice)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(sample_mp3())
+
+
 def provider():
-    return OpenRouter(httpx.Client(transport=httpx.MockTransport(handler)))
+    router = OpenRouter(
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        async_transport=httpx.MockTransport(handler),
+    )
+    original = router.transcribe
+
+    def transcribe(path, language):
+        if path.name == "reference.wav":
+            from backend.models import ClonedVoice
+            from sqlalchemy import select
+
+            with DB() as db:
+                voice = db.scalar(select(ClonedVoice).where(ClonedVoice.reference_path == str(path)))
+                text = voice.reference_text
+            return {"text": text, "segments": []}, {"usage": {"cost": 0.0001}}, httpx.Response(200)
+        return original(path, language)
+
+    router.transcribe = transcribe
+    return router
 
 
 if __name__ == "__main__":
@@ -131,6 +156,7 @@ if __name__ == "__main__":
         }
 
     Base.metadata.create_all(engine)
+    store_previews()
     with DB() as db:
         user = User(email="browser@college.edu", name="Browser Test")
         db.add(user)
@@ -145,7 +171,13 @@ if __name__ == "__main__":
                 expires=4102444800,
             )
         )
-        admin = User(email="admin-browser@college.edu", name="Test Administrator", role="admin")
+        admin = User(
+            email="admin-browser@college.edu",
+            name="Test Administrator",
+            role="admin",
+            admin_id="test-admin",
+            password_hash=passwords.hash("Browser-admin-password-123"),
+        )
         db.add(admin)
         db.flush()
         db.add(
@@ -153,6 +185,7 @@ if __name__ == "__main__":
                 token_hash=hashlib.sha256(b"admin-browser-test-token").hexdigest(),
                 user_id=admin.id,
                 csrf="browser-admin-csrf",
+                auth_method="admin_password",
                 expires=4102444800,
             )
         )
@@ -223,13 +256,31 @@ if __name__ == "__main__":
         )
         db.add(voice_meeting)
         db.flush()
-        db.add(Summary(meeting_id=voice_meeting.id, version=1, transcript_version=1, content=MINUTES))
+        db.add(
+            Summary(
+                meeting_id=voice_meeting.id,
+                version=1,
+                transcript_version=1,
+                content=MINUTES,
+                detail="standard",
+            )
+        )
+        modes_meeting = Meeting(
+            user_id=voice_user.id, title="Summary modes meeting", transcript_version=1, status="ready"
+        )
+        db.add(modes_meeting)
+        db.flush()
+        db.add(
+            Transcript(
+                meeting_id=modes_meeting.id, version=1, text="We reviewed the plan. " * 200, segments=[]
+            )
+        )
         db.commit()
     jobs.OpenRouter = provider
     main.OpenRouter = provider
-    voices.OpenRouter = provider
+    reference_quality.OpenRouter = provider
     threading.Thread(
-        target=qwen_worker.run_worker, kwargs={"engine_factory": MockQwenEngine}, daemon=True
+        target=tts_worker.run_worker, kwargs={"engine_factory": MockQwenEngine}, daemon=True
     ).start()
     threading.Thread(target=jobs.run_worker, daemon=True).start()
     uvicorn.run(main.app, host="127.0.0.1", port=8100, log_level="warning")

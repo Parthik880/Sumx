@@ -1,13 +1,11 @@
 import io
-import json
 import math
 import struct
 import wave
 from pathlib import Path
-import httpx
 import pytest
 from sqlalchemy import select
-from backend import local_tts, qwen_worker
+from backend import tts_queue, tts_worker
 from backend.config import settings
 from backend.jobs import process_job
 from backend.media import probe
@@ -24,7 +22,7 @@ from backend.models import (
     User,
 )
 from backend.provider import OpenRouter
-from backend.qwen_runtime import LocalTTSError, split_narration
+from backend.speech_contract import LocalTTSError, split_narration
 from backend.tests.qwen_mock import MockQwenEngine
 from backend.tests.test_sumx import MINUTES
 
@@ -61,7 +59,7 @@ def run_task(tid, engine=None):
         task.state = "running"
         task.attempts += 1
         db.commit()
-    qwen_worker.process(tid, engine or MockQwenEngine())
+    tts_worker.process(tid, engine or MockQwenEngine())
 
 
 @pytest.fixture(autouse=True)
@@ -86,9 +84,9 @@ def finish_preview(client, vid):
     assert client.get(f"/api/voices/{vid}").json()["preview_current"]
 
 
-def mock_generate(voice, text, key, meeting_id=None, timeout=1800, progress=None):
+def mock_generate(voice, text, key, meeting_id=None, timeout=1800, progress=None, raw_wav=False):
     with DB() as db:
-        tid = local_tts.submit(db, voice, text, key, meeting_id).id
+        tid = tts_queue.submit(db, voice, text, key, meeting_id).id
     run_task(tid)
     with DB() as db:
         task = db.get(LocalTTSGeneration, tid)
@@ -96,7 +94,8 @@ def mock_generate(voice, text, key, meeting_id=None, timeout=1800, progress=None
             progress(task)
         if task.state == "failed":
             raise LocalTTSError(task.error)
-        return Path(task.output_path).read_bytes()
+        output = Path(task.output_path)
+        return (output.with_suffix(".wav") if raw_wav else output).read_bytes()
 
 
 def test_local_voice_end_to_end_no_external_requests(user_client, monkeypatch):
@@ -120,7 +119,7 @@ def test_local_voice_end_to_end_no_external_requests(user_client, monkeypatch):
         db.add(Summary(meeting_id=m.id, version=1, transcript_version=1, content=MINUTES))
         db.commit()
         mid = m.id
-    monkeypatch.setattr(local_tts, "generate", mock_generate)
+    monkeypatch.setattr(tts_queue, "generate", mock_generate)
     result = user_client.post(
         f"/api/meetings/{mid}/speech",
         json={"voice_type": "cloned", "cloned_voice_id": vid},
@@ -136,10 +135,13 @@ def test_local_voice_end_to_end_no_external_requests(user_client, monkeypatch):
         assert audio.summary_version == 1 and probe(Path(audio.path))[0] > 0
         tasks = list(db.scalars(select(LocalTTSGeneration)))
         assert len(tasks) >= 2 and all(
-            t.provider == "local_qwen3" and t.external_api_cost == 0 for t in tasks
+            t.provider == "modal_qwen3" and t.external_api_cost >= 0 for t in tasks
         )
         assert all(t.processing_seconds > 0 and t.audio_seconds > 0 for t in tasks)
-        assert db.scalar(select(Usage)) is None
+        assert all(
+            u.provider == "modal_qwen3" and u.cost_status == "estimated" and u.cost is not None
+            for u in db.scalars(select(Usage))
+        )
         assert all(not t.text and not t.reference_text for t in tasks)
         folder = Path(db.get(ClonedVoice, vid).reference_path).parent
         aid = audio.id
@@ -152,7 +154,6 @@ def test_local_voice_end_to_end_no_external_requests(user_client, monkeypatch):
     [
         {"consent": "false"},
         {"name": "   "},
-        {"reference_text": "  "},
         {"audio": b"not audio"},
         {"audio": sample(1)},
         {"audio": sample(silent=True)},
@@ -214,7 +215,7 @@ def test_worker_failure_retry_and_missing_reference(user_client):
     tid = preview(user_client, v["id"]).json()["preview_job_id"]
 
     class OOM(MockQwenEngine):
-        def generate(self, *a, **kw):
+        def synthesize(self, *a, **kw):
             raise LocalTTSError("The GPU ran out of memory. Free memory and retry.")
 
     run_task(tid, OOM())
@@ -223,11 +224,11 @@ def test_worker_failure_retry_and_missing_reference(user_client):
     run_task(tid)
     with DB() as db:
         t = db.get(LocalTTSGeneration, tid)
-        assert t.attempts == 2 and t.state == "completed" and t.external_api_cost == 0
+        assert t.attempts == 2 and t.state == "completed" and t.external_api_cost > 0
     v2 = upload(user_client, name="Missing reference").json()
     with DB() as db:
         Path(db.get(ClonedVoice, v2["id"]).reference_path).unlink()
-    assert preview(user_client, v2["id"]).status_code == 503
+    assert preview(user_client, v2["id"]).status_code == 422
 
 
 def test_active_preview_and_csrf(user_client):
@@ -248,7 +249,7 @@ def test_existing_reference_consent_preserved(user_client):
         voice.model = "fish-audio/s2.1-pro"
         voice.reference_text = ""
         db.commit()
-    assert preview(user_client, v["id"]).status_code == 503
+    assert preview(user_client, v["id"]).status_code == 422
     user_client.patch(f"/api/voices/{v['id']}", json={"reference_text": REF_TEXT})
     finish_preview(user_client, v["id"])
     with DB() as db:
@@ -268,8 +269,7 @@ def test_long_narration_chunks(user_client, monkeypatch):
         db.add(Summary(meeting_id=m.id, version=1, transcript_version=1, content=MINUTES))
         db.commit()
         mid = m.id
-    monkeypatch.setattr(settings, "qwen_tts_chunk_chars", 100)
-    monkeypatch.setattr(local_tts, "generate", mock_generate)
+    monkeypatch.setattr(settings, "qwen_clone_chunk_words", 12)
     r = user_client.post(
         f"/api/meetings/{mid}/speech",
         json={"voice_type": "cloned", "cloned_voice_id": v["id"]},
@@ -279,8 +279,14 @@ def test_long_narration_chunks(user_client, monkeypatch):
     with DB() as db:
         assert db.get(Job, r.json()["id"]).state == "completed"
         tasks = list(db.scalars(select(LocalTTSGeneration).where(LocalTTSGeneration.meeting_id == mid)))
-        assert len(tasks) > 1 and all(t.input_characters <= 100 for t in tasks)
-        assert db.scalar(select(Usage)) is None
+        generated = MockQwenEngine.generated
+        assert len(generated) > 1 and all(len(text.split()) <= 12 for text in generated)
+        # One narration is one task and so one Modal invocation, however many chunks it has.
+        assert sum(task.purpose == "narration" for task in tasks) == 1
+        assert all(
+            u.provider == "modal_qwen3" and u.cost_status == "estimated" and u.cost is not None
+            for u in db.scalars(select(Usage))
+        )
     assert (
         " ".join(split_narration("First sentence. Second sentence.\n\nA final paragraph.", 100))
         == "First sentence. Second sentence. A final paragraph."
@@ -288,21 +294,8 @@ def test_long_narration_chunks(user_client, monkeypatch):
 
 
 def test_presets_and_separate_local_metrics(admin_client):
-    requests = []
-
-    def handler(req):
-        requests.append(json.loads(req.content))
-        return httpx.Response(200, content=b"ID3" + b"\0" * 50, headers={"content-type": "audio/mpeg"})
-
-    OpenRouter(httpx.Client(transport=httpx.MockTransport(handler))).speech("Preset", "gb_oliver_neutral")
-    assert requests == [
-        dict(
-            model=settings.openrouter_tts_model,
-            input="Preset",
-            voice="gb_oliver_neutral",
-            response_format="mp3",
-        )
-    ]
+    catalog = admin_client.get("/api/voices/presets").json()
+    assert catalog["default"] == "en_paul_neutral" and len(catalog["voices"]) == 6
     with DB() as db:
         owner = db.scalar(select(User).where(User.role == "admin"))
         db.add(

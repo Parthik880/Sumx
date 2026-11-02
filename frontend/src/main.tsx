@@ -16,6 +16,7 @@ import {
   Route,
   Routes,
   useNavigate,
+  useLocation,
   useParams,
 } from "react-router-dom";
 import {
@@ -45,6 +46,7 @@ import {
 import {
   active,
   api,
+  ApiError,
   Config,
   date,
   duration,
@@ -52,6 +54,10 @@ import {
   Minutes,
   post,
   setCsrf,
+  setAuthFailureHandler,
+  SummaryMode,
+  SummaryOverview,
+  SummaryRecord,
   upload,
   User,
 } from "./api";
@@ -63,6 +69,13 @@ import { GoogleSignIn, disableGoogleAutoSelect } from "./GoogleSignIn";
 import { VoiceStudio, VoiceCreator, NarrationPicker } from "./VoiceStudio";
 import NarrationProgress from "./NarrationProgress";
 import "./voices.css";
+import {
+  AdminLogin,
+  AdminLayout,
+  AdminOverview,
+  AdminUserDetail,
+  AdminApprovals,
+} from "./AdminWorkspace";
 
 type Context = {
   user: User | null;
@@ -123,25 +136,121 @@ function Loading() {
     </div>
   );
 }
+function AccessRevoked({ onConfirm }: { onConfirm: () => void }) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const element = dialog.current;
+    element?.showModal();
+    return () => element?.close();
+  }, []);
+  return (
+    <main className="login-page">
+      <Brand />
+      <dialog
+        ref={dialog}
+        className="confirm"
+        aria-labelledby="access-revoked-title"
+        aria-describedby="access-revoked-description"
+        onCancel={(event) => event.preventDefault()}
+      >
+        <h2 id="access-revoked-title">You are not approved</h2>
+        <p id="access-revoked-description">
+          Your access to SUMX has been revoked or is not approved. Contact your
+          administrator for access.
+        </p>
+        <div className="button-row">
+          <Button onClick={onConfirm}>OK</Button>
+        </div>
+      </dialog>
+    </main>
+  );
+}
 function App() {
   const [user, setUser] = useState<User | null>(null),
     [loading, setLoading] = useState(true),
-    [toast, setToast] = useState("");
+    [toast, setToast] = useState(""),
+    [accessRevoked, setAccessRevoked] = useState(false),
+    [revocationAcknowledged, setRevocationAcknowledged] = useState(false);
+  const userRef = useRef<User | null>(null),
+    authEpoch = useRef(0),
+    revokedNotice = useRef(false);
+  const navigate = useNavigate(),
+    location = useLocation();
+  const userId = user?.id,
+    userRole = user?.role;
   const reload = useCallback(async () => {
+    const epoch = authEpoch.current;
     try {
       const u = await api<User>("/auth/me");
+      if (epoch !== authEpoch.current) return;
       setCsrf(u.csrf);
+      userRef.current = u;
+      revokedNotice.current = false;
       setUser(u);
-    } catch {
-      setUser(null);
-      setCsrf("");
+    } catch (error) {
+      if (
+        error instanceof ApiError &&
+        (error.status === 401 || error.status === 403)
+      ) {
+        userRef.current = null;
+        setUser(null);
+        setCsrf("");
+      }
     } finally {
       setLoading(false);
     }
   }, []);
   useEffect(() => {
+    setAuthFailureHandler((reason) => {
+      if (reason !== "access_revoked" && !userRef.current) return;
+      authEpoch.current += 1;
+      userRef.current = null;
+      setUser(null);
+      setCsrf("");
+      setToast("");
+      disableGoogleAutoSelect();
+      if (reason === "access_revoked" && !revokedNotice.current) {
+        revokedNotice.current = true;
+        setRevocationAcknowledged(false);
+        setAccessRevoked(true);
+      }
+    });
     void reload();
+    return () => setAuthFailureHandler(null);
   }, [reload]);
+  useEffect(() => {
+    if (!userId || userRole === "admin") return;
+    let pending = false,
+      disposed = false;
+    const check = async () => {
+      if (pending || disposed) return;
+      pending = true;
+      try {
+        await reload();
+      } finally {
+        pending = false;
+      }
+    };
+    const visible = () => {
+      if (document.visibilityState === "visible") void check();
+    };
+    void check();
+    const timer = setInterval(() => void check(), 5000);
+    window.addEventListener("focus", visible);
+    document.addEventListener("visibilitychange", visible);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+      window.removeEventListener("focus", visible);
+      document.removeEventListener("visibilitychange", visible);
+    };
+  }, [userId, userRole, location.pathname, reload]);
+  useEffect(() => {
+    if (revocationAcknowledged && location.pathname === "/") {
+      setAccessRevoked(false);
+      setRevocationAcknowledged(false);
+    }
+  }, [revocationAcknowledged, location.pathname]);
   useEffect(() => {
     if (!toast) return;
     const id = setTimeout(() => setToast(""), 5000);
@@ -151,6 +260,15 @@ function App() {
     document.documentElement.dataset.theme = "light";
     localStorage.removeItem("sumx-theme");
   }, []);
+  if (accessRevoked)
+    return (
+      <AccessRevoked
+        onConfirm={() => {
+          setRevocationAcknowledged(true);
+          navigate("/", { replace: true });
+        }}
+      />
+    );
   if (loading)
     return (
       <main className="boot">
@@ -158,12 +276,38 @@ function App() {
         <Loading />
       </main>
     );
+  const isAdmin =
+    user?.role === "admin" && user.auth_method === "admin_password";
   return (
     <AppContext.Provider value={{ user, reload, notify: setToast }}>
       <Routes>
         <Route path="/" element={<Landing />} />
         <Route path="/login" element={<Login />} />
-        <Route path="/admin/login" element={<Login admin />} />
+        <Route
+          path="/admin"
+          element={
+            isAdmin ? (
+              <Navigate to="/admin/overview" replace />
+            ) : (
+              <AdminLogin user={user} reload={reload} />
+            )
+          }
+        />
+        <Route path="/admin/login" element={<Navigate to="/admin" replace />} />
+        <Route
+          element={
+            isAdmin ? (
+              <AdminLayout user={user!} reload={reload} />
+            ) : (
+              <Navigate to="/admin" replace />
+            )
+          }
+        >
+          <Route path="/admin/overview" element={<AdminOverview />} />
+          <Route path="/admin/users/add" element={<AdminApprovals />} />
+          <Route path="/admin/users/:id" element={<AdminUserDetail />} />
+          <Route path="/admin/analytics" element={<CostAnalytics />} />
+        </Route>
         <Route element={user ? <Shell /> : <Navigate to="/login" replace />}>
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/history" element={<Dashboard history />} />
@@ -177,21 +321,10 @@ function App() {
           <Route
             path="/analytics"
             element={
-              user?.role === "admin" ? (
-                <CostAnalytics />
-              ) : (
-                <Navigate to="/dashboard" replace />
-              )
-            }
-          />
-          <Route
-            path="/admin"
-            element={
-              user?.role === "admin" ? (
-                <Admin />
-              ) : (
-                <Navigate to="/dashboard" replace />
-              )
+              <Navigate
+                to={isAdmin ? "/admin/analytics" : "/dashboard"}
+                replace
+              />
             }
           />
         </Route>
@@ -220,7 +353,16 @@ function Landing() {
       <header className="public-nav">
         <Brand />
         <span className="nav-note">Made for conversations that matter.</span>
-        <Link className="button secondary" to={user ? "/dashboard" : "/login"}>
+        <Link
+          className="button secondary"
+          to={
+            user
+              ? user.role === "admin"
+                ? "/admin/overview"
+                : "/dashboard"
+              : "/login"
+          }
+        >
           {user ? "Open workspace" : "Sign in"} <ArrowRightIcon />
         </Link>
       </header>
@@ -239,7 +381,16 @@ function Landing() {
               searchable transcripts, useful minutes and summaries you can
               listen to.
             </p>
-            <Link className="button large" to={user ? "/dashboard" : "/login"}>
+            <Link
+              className="button large"
+              to={
+                user
+                  ? user.role === "admin"
+                    ? "/admin/overview"
+                    : "/dashboard"
+                  : "/login"
+              }
+            >
               Make room for clarity <ArrowRightIcon />
             </Link>
             <p className="hero-foot">
@@ -317,89 +468,40 @@ function Landing() {
   );
 }
 
-function Login({ admin = false }: { admin?: boolean }) {
+function Login() {
   const { user, reload } = useApp(),
     navigate = useNavigate();
-  const [error, setError] = useState(""),
-    [busy, setBusy] = useState(false);
   if (user)
     return (
       <Navigate
-        to={admin && user.role === "admin" ? "/admin" : "/dashboard"}
+        to={user.role === "admin" ? "/admin/overview" : "/dashboard"}
         replace
       />
     );
-  async function submit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    const form = new FormData(event.currentTarget);
-    try {
-      await post("/auth/admin/login", {
-        email: form.get("email"),
-        password: form.get("password"),
-      });
-      await reload();
-      navigate("/admin");
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
   return (
     <main className="login-page">
       <Brand />
       <section className="login-card">
         <span className="empty-icon">
-          {admin ? <ShieldCheckIcon size={30} /> : <WaveformIcon size={30} />}
+          <WaveformIcon size={30} />
         </span>
-        <h1>{admin ? "Administration." : "A little more clarity."}</h1>
-        <p>
-          {admin
-            ? "Sign in to manage access and monitor shared usage."
-            : "Sign in with your approved college Google account."}
+        <h1>A little more clarity.</h1>
+        <p>Sign in with your approved college Google account.</p>
+        <GoogleSignIn
+          onDenied={(message) =>
+            navigate("/?message=" + encodeURIComponent(message), {
+              replace: true,
+            })
+          }
+          onSuccess={async () => {
+            await reload();
+            navigate("/dashboard", { replace: true });
+          }}
+        />
+        <p className="small">
+          Access is limited to emails approved by your administrator. Your
+          meetings stay private to your account.
         </p>
-        {error && <Notice>{error}</Notice>}
-        {admin ? (
-          <form onSubmit={submit}>
-            <label>
-              Email
-              <input
-                name="email"
-                type="email"
-                required
-                autoComplete="username"
-              />
-            </label>
-            <label>
-              Password
-              <input
-                name="password"
-                type="password"
-                required
-                autoComplete="current-password"
-              />
-            </label>
-            <Button type="submit" disabled={busy}>
-              {busy ? "Signing in…" : "Sign in securely"}
-              <ArrowRightIcon />
-            </Button>
-          </form>
-        ) : (
-          <>
-            <GoogleSignIn
-              onSuccess={async () => {
-                await reload();
-                navigate("/dashboard", { replace: true });
-              }}
-            />
-            <p className="small">
-              Access is limited to emails approved by your administrator. Your
-              verified email must be active on the local college access list.
-            </p>
-          </>
-        )}
         <Link className="text-link" to="/">
           Back to SUMX
         </Link>
@@ -776,7 +878,11 @@ function Capture({ recording = false }: { recording?: boolean }) {
   }, [file]);
   function select(f: File) {
     setError("");
-    if (config && f.size > config.max_upload_mb * 1024 * 1024) {
+    if (
+      config &&
+      config.max_upload_mb > 0 &&
+      f.size > config.max_upload_mb * 1024 * 1024
+    ) {
       setError(`Choose a file smaller than ${config.max_upload_mb} MB.`);
       return;
     }
@@ -864,8 +970,10 @@ function Capture({ recording = false }: { recording?: boolean }) {
               <small>
                 MP3, WAV, M4A, AAC, FLAC, OGG, WebM, MP4, MOV
                 <br />
-                Up to {config?.max_upload_mb || 250} MB ·{" "}
-                {Math.round((config?.max_duration_seconds || 14400) / 3600)}{" "}
+                {config && config.max_upload_mb > 0
+                  ? `Up to ${config.max_upload_mb} MB`
+                  : "No file size limit"}{" "}
+                · {Math.round((config?.max_duration_seconds || 14400) / 3600)}{" "}
                 hours
               </small>
             </label>
@@ -1165,9 +1273,14 @@ function Detail() {
     [editing, setEditing] = useState(""),
     [transcript, setTranscript] = useState(""),
     [title, setTitle] = useState(""),
-    [detail, setDetail] = useState("standard"),
+    [detail, setDetail] = useState<SummaryMode>("standard"),
     [busy, setBusy] = useState(false),
     [confirmDelete, setConfirmDelete] = useState(false);
+  // The database is the source of truth; records are held per meeting and mode.
+  const [overview, setOverview] = useState<SummaryOverview | null>(null),
+    [records, setRecords] = useState<Record<string, SummaryRecord>>({}),
+    [narrationChoice, setNarrationChoice] = useState<SummaryMode | "">(""),
+    modeChosen = useRef(false);
   const [narrationJobId, setNarrationJobId] = useState<string | undefined>(),
     [narrationPending, setNarrationPending] = useState("");
   useEffect(() => {
@@ -1175,16 +1288,26 @@ function Detail() {
     setNarrationPending("");
   }, [id, meeting?.summary_version]);
   const refresh = useCallback(async () => {
-    const m = await api<Meeting>("/meetings/" + id);
+    const [m, o] = await Promise.all([
+      api<Meeting>("/meetings/" + id),
+      api<SummaryOverview>(`/meetings/${id}/summaries`),
+    ]);
     setMeeting(m);
+    setOverview(o);
   }, [id]);
   useEffect(() => {
     let cancelled = false;
+    modeChosen.current = false;
+    setOverview(null);
     const load = () =>
-      api<Meeting>("/meetings/" + id)
-        .then((m) => {
+      Promise.all([
+        api<Meeting>("/meetings/" + id),
+        api<SummaryOverview>(`/meetings/${id}/summaries`),
+      ])
+        .then(([m, o]) => {
           if (!cancelled) {
             setMeeting(m);
+            setOverview(o);
             setError("");
           }
         })
@@ -1198,6 +1321,43 @@ function Detail() {
       clearInterval(interval);
     };
   }, [id]);
+  useEffect(() => {
+    if (!overview || modeChosen.current) return;
+    modeChosen.current = true;
+    if (overview.latest_mode) setDetail(overview.latest_mode);
+  }, [overview]);
+  const options = overview?.narration_options ?? [];
+  const narrationMode =
+    narrationChoice && options.includes(narrationChoice)
+      ? narrationChoice
+      : options.includes(detail)
+        ? detail
+        : options[0];
+  useEffect(() => {
+    if (!overview) return;
+    for (const mode of new Set([detail, narrationMode])) {
+      if (!mode) continue;
+      const info = overview.modes[mode],
+        key = `${id}:${mode}`,
+        held = records[key];
+      if (
+        !info.exists ||
+        (held?.version === info.version &&
+          held.audio?.length === info.audio_count)
+      )
+        continue;
+      void api<SummaryRecord>(`/meetings/${id}/summaries/${mode}`)
+        .then((record) =>
+          // Filed under its own mode, so a late reply can never reach another mode.
+          setRecords((current) =>
+            (current[key]?.version ?? 0) > (record.version ?? 0)
+              ? current
+              : { ...current, [key]: record },
+          ),
+        )
+        .catch((e) => setError(e.message));
+    }
+  }, [overview, detail, narrationMode, id, records]);
   async function perform(operation: () => Promise<unknown>, message?: string) {
     setBusy(true);
     setError("");
@@ -1228,7 +1388,18 @@ function Detail() {
   const m = meeting,
     processing = active(m),
     disabled = processing || busy,
-    content = m.summary?.content;
+    info = overview?.modes[detail],
+    held = records[`${id}:${detail}`],
+    selected = held && held.version === info?.version ? held : undefined,
+    content = info?.exists ? selected?.content : undefined,
+    narrationRecord = narrationMode
+      ? records[`${id}:${narrationMode}`]
+      : undefined,
+    narrationAudio =
+      narrationMode &&
+      narrationRecord?.version === overview?.modes[narrationMode].version
+        ? narrationRecord?.audio
+        : undefined;
   return (
     <div className="page detail-page">
       <Link className="text-link back-link" to="/history">
@@ -1384,8 +1555,8 @@ function Detail() {
       >
         {tab === "summary" && (
           <>
-            {m.summary &&
-              m.summary.transcript_version !== m.transcript_version && (
+            {selected &&
+              selected.transcript_version !== m.transcript_version && (
                 <Notice>
                   The transcript has changed. Regenerate the summary to include
                   your edits.
@@ -1397,7 +1568,10 @@ function Detail() {
                 <select
                   aria-label="Summary detail"
                   value={detail}
-                  onChange={(e) => setDetail(e.target.value)}
+                  onChange={(e) => {
+                    setDetail(e.target.value as SummaryMode);
+                    setEditing("");
+                  }}
                 >
                   <option value="concise">Concise</option>
                   <option value="standard">Standard</option>
@@ -1408,11 +1582,11 @@ function Detail() {
                   disabled={disabled || !m.transcript}
                   onClick={() =>
                     perform(() =>
-                      post("/meetings/" + id + "/summarize", { detail }),
+                      post(`/meetings/${id}/summaries/${detail}/generate`),
                     )
                   }
                 >
-                  {content ? "Regenerate" : "Generate summary"}
+                  {info?.exists ? "Regenerate" : "Generate summary"}
                 </Button>
                 {content && (
                   <>
@@ -1433,7 +1607,7 @@ function Detail() {
                     <a
                       className="icon-button"
                       aria-label="Export summary"
-                      href={"/api/meetings/" + id + "/export?kind=summary"}
+                      href={`/api/meetings/${id}/export?kind=summary&mode=${detail}`}
                     >
                       <DownloadSimpleIcon />
                     </a>
@@ -1458,7 +1632,7 @@ function Detail() {
                       method: "PUT",
                       body: JSON.stringify({
                         content: c,
-                        version: m.summary!.version,
+                        version: selected!.version,
                       }),
                     });
                     setEditing("");
@@ -1472,10 +1646,25 @@ function Detail() {
                 <SummaryView content={content} />
               )
             ) : (
-              <div className="empty-search">
-                Your minutes will appear after transcription and summarization
-                complete.
-              </div>
+              <>
+                <div className="empty-search">
+                  {info?.exists
+                    ? "Loading summary…"
+                    : info?.status === "generating"
+                      ? `Generating ${detail} summary…`
+                      : info?.status === "failed"
+                        ? `The ${detail} summary could not be generated.`
+                        : !overview
+                          ? "Loading summary…"
+                          : `No ${detail} summary generated yet.`}
+                </div>
+                {overview?.legacy && (
+                  <details>
+                    <summary>Earlier summary, mode not recorded</summary>
+                    <SummaryView content={overview.legacy.content} />
+                  </details>
+                )}
+              </>
             )}
           </>
         )}
@@ -1697,12 +1886,32 @@ function Detail() {
               )}
             </section>
             <section className="audio-section">
-              <h3>Summary narration</h3>
+              <div className="toolbar">
+                <h3>Summary narration</h3>
+                <select
+                  aria-label="Narration summary"
+                  disabled={!options.length}
+                  value={narrationMode ?? ""}
+                  onChange={(e) =>
+                    setNarrationChoice(e.target.value as SummaryMode)
+                  }
+                >
+                  {options.length ? (
+                    options.map((mode) => (
+                      <option key={mode} value={mode}>
+                        {mode[0].toUpperCase() + mode.slice(1)}
+                      </option>
+                    ))
+                  ) : (
+                    <option value="">No generated summaries available.</option>
+                  )}
+                </select>
+              </div>
               <p className="subtle">
                 Generated speech is tied to this exact summary version.
               </p>
               <NarrationPicker
-                disabled={disabled || !m.summary}
+                disabled={disabled || !narrationMode}
                 generate={async (selection) => {
                   setNarrationPending(
                     selection.voice_type === "cloned"
@@ -1712,8 +1921,8 @@ function Detail() {
                   try {
                     await perform(async () => {
                       const job = await post<{ id: string }>(
-                        "/meetings/" + id + "/speech",
-                        selection,
+                        `/meetings/${id}/narrations`,
+                        { ...selection, summary_mode: narrationMode },
                       );
                       setNarrationJobId(job.id);
                     });
@@ -1726,14 +1935,14 @@ function Detail() {
                 jobId={
                   narrationJobId ||
                   (m.job?.kind === "speech" &&
-                  (m.job.state !== "completed" || !!m.audio?.length)
+                  (m.job.state !== "completed" || !!narrationAudio?.length)
                     ? m.job.id
                     : undefined)
                 }
                 pending={narrationPending}
                 onFinished={refresh}
               />
-              {m.audio?.map((a) => (
+              {narrationAudio?.map((a) => (
                 <div className="narration" key={a.id}>
                   <strong>
                     {a.voice_name || a.voice.replaceAll("_", " ")}
@@ -1886,350 +2095,6 @@ function Settings() {
           </dl>
         )}
       </section>
-    </div>
-  );
-}
-
-function Admin() {
-  const { notify } = useApp();
-  const [allowed, setAllowed] = useState<{ email: string; active: boolean }[]>(
-      [],
-    ),
-    [data, setData] = useState<any>(null),
-    [email, setEmail] = useState(""),
-    [error, setError] = useState(""),
-    [credits, setCredits] = useState<any>(null);
-  const load = useCallback(async () => {
-    const [a, d] = await Promise.all([
-      api("/admin/users"),
-      api("/admin/analytics"),
-    ]);
-    setAllowed(a);
-    setData(d);
-  }, []);
-  useEffect(() => {
-    load().catch((e) => setError(e.message));
-  }, [load]);
-  async function run(fn: () => Promise<unknown>) {
-    try {
-      setError("");
-      await fn();
-      await load();
-    } catch (e) {
-      setError((e as Error).message);
-    }
-  }
-  const money = (n: number) => "$" + n.toFixed(5);
-  return (
-    <div className="page admin-page">
-      <div className="page-heading">
-        <div>
-          <p className="eyebrow">COLLEGE ADMINISTRATION</p>
-          <h1>A clear view of your workspace.</h1>
-          <p>Manage approved accounts and review shared OpenRouter usage.</p>
-        </div>
-        <Button
-          secondary
-          onClick={() =>
-            run(async () => {
-              const r = await post("/admin/usage/reconcile");
-              notify(`${r.updated} costs verified with OpenRouter`);
-            })
-          }
-        >
-          Refresh verified costs
-        </Button>
-      </div>
-      {error && <Notice>{error}</Notice>}
-      {!data ? (
-        <Loading />
-      ) : (
-        <>
-          <div className="stats">
-            <div>
-              <span>Provider-reported spend</span>
-              <strong>{money(data.totals.reported_cost)}</strong>
-            </div>
-            <div>
-              <span>AI requests recorded</span>
-              <strong>{data.totals.requests}</strong>
-            </div>
-            <div>
-              <span>Requests with unknown cost</span>
-              <strong>{data.totals.unknown_requests}</strong>
-            </div>
-          </div>
-          <Notice>
-            Reported spend includes only costs returned by OpenRouter. Requests
-            with unavailable costs are excluded, so the total may be incomplete.
-          </Notice>
-          <section className="surface">
-            <div className="section-heading">
-              <h2>Shared credit balance</h2>
-              <Button
-                secondary
-                onClick={() =>
-                  run(async () => setCredits(await api("/admin/credits")))
-                }
-              >
-                Retrieve balance
-              </Button>
-            </div>
-            {credits && (
-              <p>
-                {money(credits.total_credits - credits.total_usage)} remaining ·{" "}
-                {money(credits.total_credits)} purchased
-              </p>
-            )}
-            <p className="small">
-              One server-side OpenRouter key. Credits are managed in OpenRouter;
-              SUMX does not collect payments.
-            </p>
-          </section>
-          <section className="surface">
-            <h2>Approved email addresses</h2>
-            <form
-              className="inline-form"
-              onSubmit={(e) => {
-                e.preventDefault();
-                void run(async () => {
-                  await post("/admin/users", { email, active: true });
-                  setEmail("");
-                });
-              }}
-            >
-              <label className="sr-only" htmlFor="allow-email">
-                Email to allow
-              </label>
-              <input
-                id="allow-email"
-                type="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="student@college.edu"
-              />
-              <Button type="submit">
-                <PlusIcon />
-                Add email
-              </Button>
-            </form>
-            {!allowed.length ? (
-              <p className="subtle">
-                No approved users yet. Add an email to enable Google sign-in.
-              </p>
-            ) : (
-              <div className="allowlist">
-                {allowed.map((a) => (
-                  <div key={a.email}>
-                    <strong>{a.email}</strong>
-                    <span className="status">
-                      {a.active ? "Active" : "Inactive"}
-                    </span>
-                    <Button
-                      secondary
-                      onClick={() =>
-                        run(() =>
-                          post("/admin/users", {
-                            email: a.email,
-                            active: !a.active,
-                          }),
-                        )
-                      }
-                    >
-                      {a.active ? "Deactivate" : "Activate"}
-                    </Button>
-                    <button
-                      className="icon-button danger"
-                      aria-label={"Remove " + a.email}
-                      onClick={() =>
-                        run(() =>
-                          api("/admin/users/" + encodeURIComponent(a.email), {
-                            method: "DELETE",
-                          }),
-                        )
-                      }
-                    >
-                      <TrashIcon />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
-          <section className="surface">
-            <h2>Participant usage</h2>
-            <div className="table-scroll">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Account</th>
-                    <th>Meetings</th>
-                    <th>Minutes</th>
-                    <th>Reported spend</th>
-                    <th>Cost / meeting</th>
-                    <th>Unknown costs</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.participants.map((p: any) => (
-                    <tr key={p.email}>
-                      <td>{p.email}</td>
-                      <td>{p.meetings}</td>
-                      <td>{p.minutes.toFixed(1)}</td>
-                      <td>{money(p.reported_cost)}</td>
-                      <td>
-                        {p.cost_per_meeting == null
-                          ? "Unavailable"
-                          : money(p.cost_per_meeting)}
-                      </td>
-                      <td>{p.unknown_requests}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </section>
-          <section className="surface">
-            <h2>Usage by operation</h2>
-            <div className="table-scroll">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Operation</th>
-                    <th>Requests</th>
-                    <th>Reported cost</th>
-                    <th>Unknown costs</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {Object.entries(data.operations).map(
-                    ([op, v]: [string, any]) => (
-                      <tr key={op}>
-                        <td>{op.toUpperCase()}</td>
-                        <td>{v.requests}</td>
-                        <td>{money(v.reported_cost)}</td>
-                        <td>{v.unknown_requests}</td>
-                      </tr>
-                    ),
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </section>
-          <section className="surface">
-            <h2>Model usage</h2>
-            {!data.models.length ? (
-              <p className="subtle">No model requests yet.</p>
-            ) : (
-              <div className="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Model</th>
-                      <th>Requests</th>
-                      <th>Reported cost</th>
-                      <th>Unknown</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {data.models.map((m: any) => (
-                      <tr key={m.model}>
-                        <td>{m.model}</td>
-                        <td>{m.requests}</td>
-                        <td>{money(m.reported_cost)}</td>
-                        <td>{m.unknown_requests}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
-          <section className="surface">
-            <h2>
-              Spending trends <small>(UTC)</small>
-            </h2>
-            {data.trends.length ? (
-              <div className="trend-list">
-                {data.trends.map((t: any) => (
-                  <div key={t.day}>
-                    <span>{t.day}</span>
-                    <strong>{money(t.reported_cost)}</strong>
-                    <span>
-                      {t.requests} requests · {t.unknown_requests} unknown costs
-                    </span>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="subtle">
-                Spending history will appear after processing meetings.
-              </p>
-            )}
-          </section>
-          <section className="surface">
-            <h2>Recent operations & failures</h2>
-            {data.recent_jobs.length ? (
-              <div className="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Job ID</th>
-                      <th>Operation</th>
-                      <th>Status</th>
-                      <th>Failure</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {data.recent_jobs.map((j: any) => (
-                      <tr key={j.id}>
-                        <td>
-                          <code>{j.id.slice(0, 12)}</code>
-                        </td>
-                        <td>{j.kind}</td>
-                        <td>{j.state}</td>
-                        <td>{j.error || "—"}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ) : (
-              <p className="subtle">No processing jobs yet.</p>
-            )}
-          </section>
-          <section className="surface">
-            <h2>Provider request records</h2>
-            <div className="table-scroll">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Operation</th>
-                    <th>Generation / request ID</th>
-                    <th>Cost</th>
-                    <th>Source</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.usage.map((u: any) => (
-                    <tr key={u.id}>
-                      <td>{u.operation}</td>
-                      <td>
-                        <code>
-                          {u.generation_id || u.request_id || "Not supplied"}
-                        </code>
-                      </td>
-                      <td>{u.cost === null ? "Unavailable" : money(u.cost)}</td>
-                      <td>{u.cost_source}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </section>
-        </>
-      )}
     </div>
   );
 }

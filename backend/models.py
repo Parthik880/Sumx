@@ -3,6 +3,7 @@ import uuid
 from decimal import Decimal
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Float,
     ForeignKey,
     Integer,
@@ -36,12 +37,29 @@ class User(Base):
     password_hash: Mapped[str | None] = mapped_column(Text)
     google_sub: Mapped[str | None] = mapped_column(String(255), unique=True, index=True)
     created: Mapped[float] = mapped_column(Float, default=time.time)
+    admin_id: Mapped[str | None] = mapped_column(String(100), unique=True, index=True)
+    picture: Mapped[str | None] = mapped_column(Text)
+    last_login: Mapped[float | None] = mapped_column(Float)
+    tts_preset_voice: Mapped[str] = mapped_column(String(64), default="en_paul_neutral")
 
 
 class AllowedEmail(Base):
     __tablename__ = "allowed_emails"
     email: Mapped[str] = mapped_column(String(320), primary_key=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    id: Mapped[str] = mapped_column(String(32), default=uid, unique=True)
+    approved_at: Mapped[float | None] = mapped_column(Float)
+    approved_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"))
+    revoked_at: Mapped[float | None] = mapped_column(Float)
+
+
+class AdminAudit(Base):
+    __tablename__ = "admin_audit"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=uid)
+    actor_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), index=True)
+    action: Mapped[str] = mapped_column(String(40))
+    target_id: Mapped[str | None] = mapped_column(String(320))
+    created: Mapped[float] = mapped_column(Float, default=time.time, index=True)
 
 
 class Session(Base):
@@ -50,6 +68,8 @@ class Session(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
     csrf: Mapped[str] = mapped_column(String(64))
     expires: Mapped[float] = mapped_column(Float)
+    auth_method: Mapped[str] = mapped_column(String(24), default="google")
+    revoked_at: Mapped[float | None] = mapped_column(Float)
 
 
 class Meeting(Base):
@@ -92,6 +112,9 @@ class Summary(Base):
     version: Mapped[int] = mapped_column(Integer)
     transcript_version: Mapped[int] = mapped_column(Integer)
     content: Mapped[dict] = mapped_column(JSON)
+    # Blank for older and hand-edited summaries, which are never reused automatically.
+    detail: Mapped[str | None] = mapped_column(String(16))
+    prompt_version: Mapped[str | None] = mapped_column(String(240))
     created: Mapped[float] = mapped_column(Float, default=time.time)
 
 
@@ -137,6 +160,7 @@ class Job(Base):
 class Usage(Base):
     __tablename__ = "api_usage"
     __table_args__ = (
+        CheckConstraint("currency = 'USD'", name="ck_api_usage_usd"),
         Index("ix_api_usage_created", "created"),
         Index("ix_api_usage_user_created", "user_id", "created"),
     )
@@ -144,6 +168,8 @@ class Usage(Base):
     meeting_id: Mapped[str | None] = mapped_column(String(32), index=True)
     user_id: Mapped[str] = mapped_column(String(32), index=True)
     operation: Mapped[str] = mapped_column(String(12))
+    provider: Mapped[str] = mapped_column(String(40), default="openrouter")
+    currency: Mapped[str] = mapped_column(String(3), default="USD")
     model: Mapped[str] = mapped_column(String(200))
     generation_id: Mapped[str | None] = mapped_column(String(200))
     request_id: Mapped[str | None] = mapped_column(String(200))
@@ -168,6 +194,9 @@ class ClonedVoice(Base):
     description: Mapped[str] = mapped_column(String(500), default="")
     reference_path: Mapped[str] = mapped_column(Text)
     reference_text: Mapped[str] = mapped_column(Text, default="")
+    reference_verified_at: Mapped[float | None] = mapped_column(Float)
+    reference_quality: Mapped[dict] = mapped_column(JSON, default=dict)
+    preview_version: Mapped[str | None] = mapped_column(String(80))
     duration: Mapped[float] = mapped_column(Float)
     language: Mapped[str] = mapped_column(String(8), default="en")
     model: Mapped[str] = mapped_column(String(200))
@@ -187,7 +216,11 @@ class LocalTTSGeneration(Base):
     user_id: Mapped[str] = mapped_column(String(32), index=True)
     voice_id: Mapped[str] = mapped_column(String(32), index=True)
     meeting_id: Mapped[str | None] = mapped_column(String(32), index=True)
-    provider: Mapped[str] = mapped_column(String(24), default="local_qwen3")
+    provider: Mapped[str] = mapped_column(String(24), default="modal_qwen3")
+    remote_call_id: Mapped[str | None] = mapped_column(String(80))
+    voice_type: Mapped[str] = mapped_column(String(16), default="cloned")
+    preset_voice: Mapped[str | None] = mapped_column(String(64))
+    diagnostics: Mapped[dict] = mapped_column(JSON, default=dict)
     model: Mapped[str] = mapped_column(String(200))
     purpose: Mapped[str] = mapped_column(String(24))
     text: Mapped[str] = mapped_column(Text)
@@ -223,7 +256,7 @@ class LocalTTSWorker(Base):
     peak_vram_mb: Mapped[float] = mapped_column(Float, default=0)
     error: Mapped[str | None] = mapped_column(Text)
     heartbeat: Mapped[float] = mapped_column(Float, default=time.time)
-    engine: Mapped[str] = mapped_column(String(40), default="faster_qwen3")
+    engine: Mapped[str] = mapped_column(String(40), default="modal_faster_qwen3")
     cuda_graphs: Mapped[bool] = mapped_column(Boolean, default=False)
     load_seconds: Mapped[float] = mapped_column(Float, default=0)
     warmup_seconds: Mapped[float] = mapped_column(Float, default=0)

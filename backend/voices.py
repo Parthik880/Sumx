@@ -1,29 +1,33 @@
 """Owner-only reference recordings. A saved profile reuses audio; it trains no model."""
 
-import array
 import shutil
 import time
-import wave
 from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from .config import settings
 from .jobs import ACTIVE
 from .media import MIMES, probe, run, safe_path, signature_ok
 from .models import ClonedVoice, Job, LocalTTSGeneration, Meeting, User, get_db, uid
-from .provider import OpenRouter
-from . import local_tts
-from .qwen_runtime import LANGUAGES, LocalTTSError
+from . import tts_queue
 from .security import current_user, rate_limit
+from .speech_contract import (
+    LANGUAGES,
+    PIPELINE_VERSION,
+    PREVIEW_TEXT,
+    LocalTTSError,
+    pcm_metrics,
+)
+from .preset_voices import PRESETS
+from .voice_catalog import catalog, default_preset, preset_entry, preset_id, preview_file
 
 router = APIRouter(prefix="/api/voices")
-PREVIEW_TEXT = "Hello! This is my new voice in SUMX. I can now narrate my meeting summaries."
 
 
 def owned(db, voice_id, user):
@@ -56,12 +60,18 @@ def info(v):
         "preview_running": local_running or v.preview_until > time.time(),
         "preview_current": bool(v.preview_path)
         and v.model == settings.qwen_tts_model
+        and v.preview_version == PIPELINE_VERSION
+        and bool(v.reference_verified_at)
         and bool(v.reference_text.strip()),
         "preview_stage": preview_stage,
         "usable": v.saved
+        and v.model == settings.qwen_tts_model
+        and v.preview_version == PIPELINE_VERSION
+        and bool(v.reference_verified_at)
         and bool(v.reference_text.strip())
         and bool(v.consent_at)
         and v.language in LANGUAGES,
+        "reenrollment_required": v.preview_version != PIPELINE_VERSION or not v.reference_verified_at,
     }
 
 
@@ -110,18 +120,50 @@ def no_voice_work(db, user_id, voice_id=None):
 
 @router.get("/presets")
 def presets(user=Depends(current_user), db: Session = Depends(get_db)):
-    rate_limit(db, "voices:" + user.id, 30, 3600)
-    provider = OpenRouter()
+    rate_limit(db, "voices:" + user.id, 300, 3600)
+    return {
+        "voices": list(PRESETS),
+        "default": default_preset(user),
+        "preview_text": PREVIEW_TEXT,
+        "speakers": [preset_entry(voice) for voice in PRESETS],
+    }
+
+
+@router.get("/catalog")
+def voice_catalog(user=Depends(current_user), db: Session = Depends(get_db)):
+    return {"voices": catalog(db, user), "default": default_preset(user)}
+
+
+class VoicePreference(BaseModel):
+    preset_voice_id: str = Field(min_length=1, max_length=64)
+
+
+@router.post("/preferences")
+def preference(body: VoicePreference, user=Depends(current_user), db: Session = Depends(get_db)):
     try:
-        return {"voices": provider.voices(), "default": settings.openrouter_tts_voice}
-    finally:
-        provider.close()
+        user.tts_preset_voice = preset_id(body.preset_voice_id)
+    except LocalTTSError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    db.commit()
+    return {"default": user.tts_preset_voice}
+
+
+@router.get("/presets/{voice}/preview")
+def preset_preview(voice: str, user=Depends(current_user)):
+    """A stored file only. A missing preview is reported, never generated."""
+    if voice not in PRESETS or not preview_file(voice).is_file():
+        raise HTTPException(404, "Preview unavailable")
+    return FileResponse(
+        preview_file(voice),
+        media_type="audio/mpeg",
+        headers={"Cache-Control": "private, max-age=31536000, immutable"},
+    )
 
 
 @router.get("/capabilities")
 def capabilities(user=Depends(current_user), db: Session = Depends(get_db)):
     rate_limit(db, "voice-capabilities:" + user.id, 1800, 3600)
-    return local_tts.status(db)
+    return tts_queue.status(db)
 
 
 @router.get("")
@@ -147,14 +189,14 @@ def create_voice(
     description: str = Form("", max_length=500),
     language: str = Form("en", max_length=8),
     consent: bool = Form(False),
-    reference_text: str = Form(..., min_length=1, max_length=5000),
+    reference_text: str = Form("", max_length=5000),
     file: UploadFile = File(...),
     user=Depends(current_user),
     db: Session = Depends(get_db),
 ):
     if not consent:
         raise HTTPException(422, "Explicit permission to create and use this voice is required")
-    if not name.strip() or language not in LANGUAGES or not reference_text.strip():
+    if not name.strip() or language not in LANGUAGES:
         raise HTTPException(422, "Enter a voice name and supported language")
     rate_limit(db, "voice-create:" + user.id, 20, 3600)
     ext = Path(file.filename or "").suffix.lower()
@@ -178,8 +220,8 @@ def create_voice(
         if not signature_ok(source):
             raise ValueError("The recording is not a supported audio file")
         duration, video = probe(source)
-        if video or not 3 <= duration <= 30.5:
-            raise ValueError("Record 3–30 seconds of audio only; 15–30 seconds is recommended")
+        if video or not 3 <= duration <= 30:
+            raise ValueError("Record 3–30 seconds of audio only; 5–15 seconds is recommended")
         run(
             [
                 settings.ffmpeg,
@@ -191,8 +233,6 @@ def create_voice(
                 "file,pipe",
                 "-i",
                 str(source),
-                "-t",
-                "30",
                 "-vn",
                 "-ac",
                 "1",
@@ -203,15 +243,16 @@ def create_voice(
                 str(target),
             ]
         )
-        with wave.open(str(target), "rb") as recording:
-            samples = array.array("h", recording.readframes(recording.getnframes()))
-        if not samples or sum(s * s for s in samples) / len(samples) < 10000:
-            raise ValueError(
-                "The sample is silent or too quiet. Move closer to your microphone and record again."
-            )
+        quality = pcm_metrics(target.read_bytes(), reference=True)
         source.unlink()
         lock_user(db, user.id)
         no_voice_work(db, user.id)
+        if db.scalar(
+            select(ClonedVoice.id).where(
+                ClonedVoice.user_id == user.id, func.lower(ClonedVoice.name) == name.strip().lower()
+            )
+        ):
+            raise HTTPException(409, "You already have a voice with this name")
         voice = ClonedVoice(
             id=voice_id,
             user_id=user.id,
@@ -220,6 +261,7 @@ def create_voice(
             language=language,
             reference_path=str(target),
             reference_text=reference_text.strip(),
+            reference_quality=quality,
             duration=min(duration, 30),
             model=settings.qwen_tts_model,
             consent_at=time.time(),
@@ -261,6 +303,14 @@ class VoiceEdit(BaseModel):
 def edit_voice(voice_id: str, body: VoiceEdit, user=Depends(current_user), db: Session = Depends(get_db)):
     lock_user(db, user.id)
     v = owned(db, voice_id, user)
+    if body.name and db.scalar(
+        select(ClonedVoice.id).where(
+            ClonedVoice.user_id == user.id,
+            ClonedVoice.id != v.id,
+            func.lower(ClonedVoice.name) == body.name.lower(),
+        )
+    ):
+        raise HTTPException(409, "You already have a voice with this name")
     if body.language is not None and body.language not in LANGUAGES:
         raise HTTPException(422, "Choose a supported Qwen3-TTS language")
     if body.reference_text is not None and not body.reference_text.strip():
@@ -270,7 +320,13 @@ def edit_voice(voice_id: str, body: VoiceEdit, user=Depends(current_user), db: S
     ):
         no_voice_work(db, user.id, v.id)
         v.saved, v.model = False, ""
-    if body.saved and (not v.preview_path or v.model != settings.qwen_tts_model):
+        v.reference_verified_at, v.preview_version = None, None
+    if body.saved and (
+        not v.preview_path
+        or v.model != settings.qwen_tts_model
+        or v.preview_version != PIPELINE_VERSION
+        or not v.reference_verified_at
+    ):
         raise HTTPException(
             409,
             "Generate and review a real preview before saving this voice. The reference remains a private draft.",
@@ -303,13 +359,21 @@ def delete_voice(voice_id: str, user=Depends(current_user), db: Session = Depend
 def preview(
     voice_id: str,
     key: str = Header(..., alias="Idempotency-Key", min_length=16, max_length=100),
+    refresh: bool = Query(False),
     user=Depends(current_user),
     db: Session = Depends(get_db),
 ):
     rate_limit(db, "voice-preview:" + user.id, 12, 3600)
     lock_user(db, user.id)
     v = owned(db, voice_id, user)
-    if v.preview_path and v.model == settings.qwen_tts_model and v.reference_text.strip():
+    if (
+        not refresh
+        and v.preview_path
+        and v.model == settings.qwen_tts_model
+        and v.preview_version == PIPELINE_VERSION
+        and v.reference_verified_at
+        and v.reference_text.strip()
+    ):
         return info(v)
     # A repeated click resumes the same queued/running private task.
     running = db.scalar(
@@ -321,11 +385,33 @@ def preview(
     )
     if running:
         return info(v)
+    if v.preview_until > time.time():
+        return info(v)
     no_voice_work(db, user.id)
+    if not tts_queue.status(db)["accepting"]:
+        raise HTTPException(503, tts_queue.status(db)["message"])
+    v.preview_until, v.preview_error = time.time() + settings.qwen_tts_timeout, None
+    db.commit()
     try:
-        task = local_tts.submit(db, v, PREVIEW_TEXT, "preview:" + v.id)
-    except LocalTTSError as exc:
-        raise HTTPException(503, str(exc)) from exc
+        from .reference_quality import verify_reference
+
+        verify_reference(db, v)
+        task = tts_queue.submit(
+            db, v, PREVIEW_TEXT, "preview:" + v.id + (f":{int(time.time())}" if refresh else "")
+        )
+    except Exception as exc:
+        db.rollback()
+        db.refresh(v)
+        v.preview_until = 0
+        v.preview_error = (
+            str(exc)
+            if isinstance(exc, LocalTTSError)
+            else "Reference validation failed. Check transcription settings and retry."
+        )
+        db.commit()
+        if isinstance(exc, LocalTTSError):
+            raise HTTPException(422, str(exc)) from exc
+        raise
     db.refresh(v)
     return {**info(v), "preview_job_id": task.id}
 

@@ -11,3 +11,4 @@ itsdangerous==2.2.0
 pytest==9.2.0
 ruff==0.14.6
 starlette==1.10.0
+modal==1.6.3

@@ -13,7 +13,7 @@ from backend.limits import BodyLimitMiddleware
 from backend.media import probe
 from backend.models import DB, Job
 from backend.provider import OpenRouter, ProviderError
-from backend.tests.test_sumx import MINUTES, upload
+from backend.tests.test_sumx import MINUTES, upload, wav_bytes
 
 
 def test_body_limit_without_content_length():
@@ -111,5 +111,34 @@ def test_duration_and_size_caps(user_client, monkeypatch):
     monkeypatch.setattr(settings, "max_duration_seconds", 0.5)
     assert upload(user_client).status_code == 422
     monkeypatch.setattr(settings, "max_duration_seconds", 14400)
+    monkeypatch.setattr(settings, "max_upload_mb", 1)
+    assert (
+        user_client.post(
+            "/api/meetings/upload",
+            data={"consent": "true"},
+            files={"file": ("large.wav", wav_bytes() + b"\0" * 1048576, "audio/wav")},
+            headers={"Idempotency-Key": "oversized-file-123456"},
+        ).status_code
+        == 413
+    )
+
+
+def test_meeting_larger_than_250_mb_is_accepted_without_cap(user_client, monkeypatch, tmp_path):
+    from backend import main
+
     monkeypatch.setattr(settings, "max_upload_mb", 0)
-    assert upload(user_client, "oversized-file-123456").status_code == 413
+    # Exercise real request and file streaming without sending this padded fixture to FFmpeg/AI.
+    monkeypatch.setattr(main, "probe", lambda path: (1.0, False))
+    source = tmp_path / "large.wav"
+    with source.open("wb") as file:
+        file.write(wav_bytes())
+        file.truncate(251 * 1024 * 1024)
+    with source.open("rb") as file:
+        result = user_client.post(
+            "/api/meetings/upload",
+            data={"consent": "true"},
+            files={"file": ("large.wav", file, "audio/wav")},
+            headers={"Idempotency-Key": "large-file-unlimited-12345"},
+        )
+    assert result.status_code == 200, result.text
+    assert result.json()["status"] == "queued"

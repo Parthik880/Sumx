@@ -121,7 +121,9 @@ def test_double_click_idempotence_and_queue_different_meetings(user_client):
             consent_at=time.time(),
             saved=True,
             preview_path="old-preview.mp3",
-            model="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+            model=settings.qwen_tts_model,
+            reference_verified_at=time.time(),
+            preview_version="faster-qwen-local-icl-v1",
         )
         a = Meeting(user_id=user_client.user_id, title="First", summary_version=1)
         b = Meeting(user_id=user_client.user_id, title="Second", summary_version=1)

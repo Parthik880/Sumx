@@ -449,7 +449,7 @@ export default function CostAnalytics() {
           </div>
           <section className="surface model-cost-card">
             <div className="section-heading">
-              <h2>Local GPU narration</h2>
+              <h2>Modal GPU narration</h2>
               <span className="subtle small">Separate from API spending</span>
             </div>
             <p>
@@ -459,13 +459,13 @@ export default function CostAnalytics() {
             </p>
             <p className="subtle small">
               {Math.round(data.local_tts.processing_seconds)} seconds processing
-              · {Math.round(data.local_tts.peak_vram_mb)} MB peak GPU memory ·
-              $0 external API charges. Local hardware and electricity still have
-              a cost.
+              · {Math.round(data.local_tts.peak_vram_mb)} MB peak GPU memory · $
+              {data.local_tts.external_api_cost_usd} estimated from published
+              GPU rates. Modal invoices may differ.
             </p>
             <p className="subtle small">
               {data.local_tts.models.join(", ") ||
-                "No local generations in this period."}
+                "No GPU generations in this period."}
             </p>
           </section>
           <section className="surface model-cost-card">

@@ -67,12 +67,15 @@ export function disableGoogleAutoSelect() {
 
 export function GoogleSignIn({
   onSuccess,
+  onDenied,
 }: {
   onSuccess: () => Promise<void>;
+  onDenied?: (message: string) => void;
 }) {
   const container = useRef<HTMLDivElement>(null),
     config = useRef<Promise<{ client_id: string; nonce: string }> | null>(null),
     pending = useRef(false),
+    denied = useRef(onDenied),
     success = useRef(onSuccess);
   const [error, setError] = useState(""),
     [ready, setReady] = useState(false),
@@ -80,7 +83,8 @@ export function GoogleSignIn({
     [attempt, setAttempt] = useState(0);
   useEffect(() => {
     success.current = onSuccess;
-  }, [onSuccess]);
+    denied.current = onDenied;
+  }, [onSuccess, onDenied]);
   useEffect(() => {
     let disposed = false;
     setReady(false);
@@ -105,6 +109,14 @@ export function GoogleSignIn({
               if (!disposed) await success.current();
             } catch (e) {
               if (!disposed) {
+                if (
+                  e instanceof Error &&
+                  e.message.startsWith("Access denied.") &&
+                  denied.current
+                ) {
+                  denied.current(e.message);
+                  return;
+                }
                 setError((e as Error).message);
                 config.current = null;
                 setAttempt((n) => n + 1);

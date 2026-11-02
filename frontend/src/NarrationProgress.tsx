@@ -123,7 +123,7 @@ export default function NarrationProgress({
                 : "Generating narration"}
           </h4>
           <p>
-            {current?.engine || pending || "Local narration"}
+            {current?.engine || pending || "GPU narration"}
             {current?.gpu_name ? " · " + current.gpu_name : ""}
           </p>
         </div>

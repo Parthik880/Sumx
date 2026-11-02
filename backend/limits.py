@@ -2,13 +2,13 @@ from starlette.exceptions import HTTPException
 
 
 class BodyLimitMiddleware:
-    """Enforce the cap while reading, including requests without Content-Length."""
+    """Enforce an optional cap while reading; None disables the request-size cap."""
 
     def __init__(self, app, limit):
         self.app, self.limit = app, limit
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
+        if scope["type"] != "http" or self.limit is None:
             return await self.app(scope, receive, send)
         count = 0
 

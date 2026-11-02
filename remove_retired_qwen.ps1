@@ -1,11 +1,10 @@
-# Manual cleanup only. Automatic execution was blocked by tool approval review.
+# Manual cleanup only. Removes local GPU files that SUMX no longer uses; speech runs on Modal.
 $ErrorActionPreference='Stop'
 $sumxRoot=(Resolve-Path -LiteralPath $PSScriptRoot).Path
-$sumxOldEnv=Join-Path $sumxRoot '.venv-qwen'
-$sumxOldModel=Join-Path $sumxRoot 'models\qwen3-tts\models--Qwen--Qwen3-TTS-12Hz-1.7B-Base'
-$sumxActive=Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^python(w)?\.exe$' -and $_.CommandLine -match ([regex]::Escape($sumxOldEnv)) }
+$sumxTargets=@('.venv-qwen','.venv-faster-qwen','models') | ForEach-Object { Join-Path $sumxRoot $_ }
+$sumxActive=Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^python(w)?\.exe$' -and $_.CommandLine -match '\.venv-(faster-)?qwen' }
 if ($sumxActive) {throw 'The retired environment is still in use. Stop its process before cleanup.'}
-foreach ($sumxTarget in @($sumxOldEnv,$sumxOldModel)) {
+foreach ($sumxTarget in $sumxTargets) {
     $sumxAbsolute=[System.IO.Path]::GetFullPath($sumxTarget)
     if (-not $sumxAbsolute.StartsWith($sumxRoot+[System.IO.Path]::DirectorySeparatorChar,[System.StringComparison]::OrdinalIgnoreCase)) {throw 'Unsafe cleanup target outside SUMX.'}
     if (Test-Path -LiteralPath $sumxAbsolute) {
@@ -15,4 +14,4 @@ foreach ($sumxTarget in @($sumxOldEnv,$sumxOldModel)) {
         Remove-Item -LiteralPath $sumxAbsolute -Recurse -Force
     }
 }
-Write-Output 'Retired standard environment and 1.7B weights removed. Faster runtime, 0.6B weights and all user data are preserved.'
+Write-Output 'Local GPU environments and model weights removed. All user data is preserved.'
