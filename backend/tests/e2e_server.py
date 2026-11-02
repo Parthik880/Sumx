@@ -89,8 +89,10 @@ def handler(request):
 
 
 def store_previews():
-    """Every preset has a preview except the last, which covers the unavailable state."""
-    for voice in list(PRESETS)[:-1]:
+    """Keep one legacy preset unavailable; all regional previews are stored files."""
+    for voice in PRESETS:
+        if voice == "gb_jane_confident":
+            continue
         target = preview_file(voice)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(sample_mp3())

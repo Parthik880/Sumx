@@ -44,16 +44,28 @@ def note_groups(parts):
     return groups
 
 
-def build_summary(router, text, mode, on_call, *, transcript_words=None, parts=None, on_part=None):
+def build_summary(router, text, mode, on_call, *, transcript_words=None, parts=None, on_part=None,
+                  metrics=None, on_metrics=None):
     """Summarize `text` in `mode`. Long transcripts become notes first, then one final summary."""
     target = target_words(mode, transcript_words or len(text.split()))
     chunks = text_chunks(text, settings.summary_chunk_chars)
     parts = list(parts or [])
-    calls = 0
+    metrics = dict(metrics or {})
+    metrics.update(mode=mode, transcript_chunks=len(chunks), target_words=target, records_saved=0)
+    for key in ("llm_calls", "note_calls", "synthesis_calls", "correction_calls", "direct_calls"):
+        metrics.setdefault(key, 0)
 
     def ask(body, synthesis=False, **options):
-        nonlocal calls
-        calls += 1
+        category = ("correction_calls" if options.get("correction") else "note_calls"
+                    if options.get("notes") else "synthesis_calls" if synthesis else "direct_calls")
+
+        def count():
+            metrics["llm_calls"] += 1
+            metrics[category] += 1
+            if on_metrics:
+                on_metrics(metrics)
+
+        count()
         try:
             result, data, response = router.summarize(body, mode, synthesis, **options)
         except ProviderError as exc:
@@ -61,7 +73,7 @@ def build_summary(router, text, mode, on_call, *, transcript_words=None, parts=N
                 raise
             # The rejected call was still billed, so it is recorded before the single retry.
             on_call(exc.response.json(), exc.response)
-            calls += 1
+            count()
             result, data, response = router.summarize(body, mode, synthesis, **options, token_scale=2)
         on_call(data, response)
         return result
@@ -93,10 +105,5 @@ def build_summary(router, text, mode, on_call, *, transcript_words=None, parts=N
             shorter = None  # The uncorrected summary is still valid and already paid for.
         if shorter is not None and summary_words(shorter) < words:
             content, corrected = shorter, True
-    return content, {
-        "mode": mode,
-        "target_words": target,
-        "summary_words": summary_words(content),
-        "corrected": corrected,
-        "llm_calls": calls,
-    }
+    metrics.update(summary_words=summary_words(content), corrected=corrected)
+    return content, metrics

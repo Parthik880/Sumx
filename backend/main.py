@@ -26,7 +26,7 @@ from .admin import (
 )
 from .money import usd
 from . import summaries
-from .jobs import ACTIVE, enqueue, latest
+from .jobs import ACTIVE, JobConflict, enqueue, latest
 from .media import EXTENSIONS, MIMES, probe, safe_path, signature_ok
 from .limits import BodyLimitMiddleware
 from .models import AllowedEmail, AudioOutput, Job, Meeting, Session, Summary, Transcript, Usage, User, get_db
@@ -56,6 +56,13 @@ async def lifespan(app):
 
 
 app = FastAPI(title="SUMX", lifespan=lifespan)
+
+
+@app.exception_handler(JobConflict)
+async def job_conflict(request, exc):
+    return JSONResponse({"detail": str(exc)}, status_code=409)
+
+
 app.include_router(analytics_router)
 app.include_router(voices_router)
 app.include_router(admin_router)
@@ -257,6 +264,7 @@ def brief(m):
             "transcript_version",
             "summary_version",
             "retain_source",
+            "detail",
         ]
     }
 
@@ -508,10 +516,6 @@ def generate_summary(
     user=Depends(current_user),
     db: DBSession = Depends(get_db),
 ):
-    owns(db, Meeting, meeting_id, user)
-    running = db.scalar(select(Job).where(Job.meeting_id == meeting_id, Job.state.in_(ACTIVE)))
-    if running and not (running.kind == "summarize" and running.payload.get("detail") == mode):
-        raise HTTPException(409, "This meeting is busy. Try again when the current task finishes.")
     return queue_operation(db, user, meeting_id, "summarize", key, {"detail": mode})
 
 

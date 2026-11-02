@@ -991,6 +991,7 @@ type PresetVoice = {
   id: string;
   name: string;
   description: string;
+  group: string;
   preview_url: string | null;
 };
 
@@ -1097,10 +1098,14 @@ export function NarrationPicker({
                 }).catch((error) => setError(error.message));
               }}
             >
-              {presets.map((v) => (
-                <option key={v.id} value={v.id}>
-                  {v.name} · {v.description}
-                </option>
+              {[...new Set(presets.map((v) => v.group))].map((group) => (
+                <optgroup key={group} label={group}>
+                  {presets.filter((v) => v.group === group).map((v) => (
+                    <option key={v.id} value={v.id}>
+                      {v.name} · {v.description}
+                    </option>
+                  ))}
+                </optgroup>
               ))}
             </select>
           )}

@@ -1035,6 +1035,7 @@ function Capture({ recording = false }: { recording?: boolean }) {
               <option value="standard">Standard</option>
               <option value="detailed">Detailed</option>
             </select>
+            <small>Only the selected summary is generated automatically after transcription.</small>
           </label>
           <label className="check">
             <input
@@ -1281,6 +1282,8 @@ function Detail() {
     [records, setRecords] = useState<Record<string, SummaryRecord>>({}),
     [narrationChoice, setNarrationChoice] = useState<SummaryMode | "">(""),
     modeChosen = useRef(false);
+  const summaryAttempt = useRef<{ mode: SummaryMode; key: string } | null>(null),
+    summarySubmitting = useRef(false);
   const [narrationJobId, setNarrationJobId] = useState<string | undefined>(),
     [narrationPending, setNarrationPending] = useState("");
   useEffect(() => {
@@ -1298,6 +1301,7 @@ function Detail() {
   useEffect(() => {
     let cancelled = false;
     modeChosen.current = false;
+    summaryAttempt.current = null;
     setOverview(null);
     const load = () =>
       Promise.all([
@@ -1324,8 +1328,21 @@ function Detail() {
   useEffect(() => {
     if (!overview || modeChosen.current) return;
     modeChosen.current = true;
-    if (overview.latest_mode) setDetail(overview.latest_mode);
-  }, [overview]);
+    setDetail(overview.latest_mode ?? meeting?.detail ?? "standard");
+  }, [overview, meeting]);
+  async function generateSummary() {
+    if (summarySubmitting.current) return;
+    summarySubmitting.current = true;
+    const mode = detail;
+    if (summaryAttempt.current?.mode !== mode)
+      summaryAttempt.current = { mode, key: crypto.randomUUID() };
+    const key = summaryAttempt.current.key;
+    await perform(async () => {
+      await post(`/meetings/${id}/summaries/${mode}/generate`, {}, key);
+      summaryAttempt.current = null;
+    });
+    summarySubmitting.current = false;
+  }
   const options = overview?.narration_options ?? [];
   const narrationMode =
     narrationChoice && options.includes(narrationChoice)
@@ -1569,6 +1586,7 @@ function Detail() {
                   aria-label="Summary detail"
                   value={detail}
                   onChange={(e) => {
+                    modeChosen.current = true;
                     setDetail(e.target.value as SummaryMode);
                     setEditing("");
                   }}
@@ -1580,11 +1598,7 @@ function Detail() {
                 <Button
                   secondary
                   disabled={disabled || !m.transcript}
-                  onClick={() =>
-                    perform(() =>
-                      post(`/meetings/${id}/summaries/${detail}/generate`),
-                    )
-                  }
+                  onClick={() => void generateSummary()}
                 >
                   {info?.exists ? "Regenerate" : "Generate summary"}
                 </Button>

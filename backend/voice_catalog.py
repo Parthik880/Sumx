@@ -29,6 +29,8 @@ def preset_entry(voice):
         "name": PRESETS[voice]["name"],
         "description": PRESETS[voice]["description"],
         "language": PRESETS[voice]["language"],
+        "group": PRESETS[voice]["group"],
+        "gender": PRESETS[voice]["gender"],
         "voice_type": "preset",
         "provider": "openrouter",
         "provider_voice_id": voice,

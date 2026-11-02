@@ -11,7 +11,7 @@ from backend import tts_queue
 from backend.config import settings
 from backend.jobs import process_job
 from backend.models import DB, Job, LocalTTSWorker, Meeting, Summary, Usage
-from backend.preset_voices import DEFAULT_PRESET, PRESET_MODEL, PRESETS, PREVIEW_VERSION
+from backend.preset_voices import DEFAULT_PRESET, PRESET_MODEL, PRESETS, PREVIEW_VERSION, preview_text
 from backend.provider import OpenRouter, ProviderError
 from backend.services.preset_tts import generate_preset
 from backend.services.modal_tts_client import ModalSpeechClient
@@ -85,7 +85,77 @@ def meeting(owner):
 def test_curated_presets_are_real_provider_ids_with_default():
     assert settings.openrouter_tts_model == PRESET_MODEL == "mistralai/voxtral-mini-tts-3-0"
     assert settings.tts_default_voice == DEFAULT_PRESET in PRESETS
-    assert {v["description"].split()[-1] for v in PRESETS.values()} == {"male", "female"}
+    assert {v["gender"] for v in PRESETS.values()} == {"male", "female", None}
+    assert len(PRESETS) == 32
+    assert len({v["group"] for v in PRESETS.values()}) == 22
+    assert PRESETS["voice_3153"]["language"] == "hi"
+    assert PRESETS["voice_3139"]["group"] == "Hindi"
+    assert PRESETS["voice_3136"]["gender"] is None
+    assert all(preview_text(voice) for voice in PRESETS)
+
+
+def test_all_catalog_previews_and_preferences_are_provider_free(user_client, tmp_path, no_inference, monkeypatch):
+    # One fake saved MP3 is enough to prove routing/cache behavior for every preset.
+    monkeypatch.setattr(settings, "storage_dir", tmp_path)
+    audio = mp3(tmp_path / "preview.mp3").read_bytes()
+    for voice in PRESETS:
+        target = preview_file(voice)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(audio)
+        entry = next(v for v in user_client.get("/api/voices/presets").json()["speakers"] if v["id"] == voice)
+        assert entry["group"] == PRESETS[voice]["group"]
+        assert entry["gender"] == PRESETS[voice]["gender"]
+        assert user_client.post("/api/voices/preferences", json={"preset_voice_id": voice}).status_code == 200
+        for _ in range(2):
+            response = user_client.get(entry["preview_url"])
+            assert response.content == audio and "immutable" in response.headers["cache-control"]
+
+
+def test_preview_generator_uses_native_text_without_changing_english(monkeypatch, tmp_path):
+    from backend import preset_previews
+    from backend.speech_contract import PREVIEW_TEXT
+
+    monkeypatch.setattr(settings, "storage_dir", tmp_path)
+    monkeypatch.setattr(preset_previews, "probe", lambda path: (4, {}))
+    monkeypatch.setattr(preset_previews, "ledger_owner", lambda db: "unused")
+    monkeypatch.setattr(preset_previews, "account", lambda *a, **k: None)
+    seen = []
+
+    class Router:
+        def speech(self, text, voice):
+            seen.append((text, voice))
+            return b"fake", {}, None
+
+    for voice in PRESETS:
+        preset_previews.generate(voice, Router())
+    assert all(text == preview_text(voice) for text, voice in seen)
+    assert all(text == PREVIEW_TEXT for text, voice in seen if PRESETS[voice]["language"] == "en")
+    assert all(text != PREVIEW_TEXT for text, voice in seen if PRESETS[voice]["language"] != "en")
+
+
+@pytest.mark.parametrize("voice", [v for v in PRESETS if v.startswith("voice_")])
+def test_each_new_preset_narrates_through_openrouter(user_client, voice):
+    mid = meeting(user_client.user_id)
+    response = user_client.post(
+        f"/api/meetings/{mid}/speech",
+        json={"voice_type": "preset", "preset_voice_id": voice},
+        headers={"Idempotency-Key": "regional-voice-test-1234"},
+    )
+    assert response.status_code == 200
+    provider = MockRouter()
+    seen = []
+    original = provider.speech_async
+
+    async def speech(text, requested, client):
+        seen.append(requested)
+        return await original(text, requested, client)
+
+    provider.speech_async = speech
+    process_job(response.json()["id"], provider)
+    with DB() as db:
+        job = db.get(Job, response.json()["id"])
+        assert job.state == "completed", job.error
+    assert seen and set(seen) == {voice}
 
 
 def test_selecting_and_replaying_a_preview_makes_no_provider_calls(user_client, stored_preview, no_inference):
@@ -270,6 +340,12 @@ def test_preview_command_skips_existing_files(user_client, stored_preview, monke
     calls = []
 
     class Router:
+        def request(self, *args, **kwargs):
+            return httpx.Response(200, json={"data": [{"id": PRESET_MODEL, "supported_voices": list(PRESETS)}]})
+
+        def json(self, response):
+            return response.json()
+
         def speech(self, text, voice):
             calls.append((text, voice))
             sample = mp3(Path(settings.storage_dir) / "sample.mp3")

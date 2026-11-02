@@ -220,14 +220,21 @@ test("stored preset previews play with no inference call and switching stops pla
       .evaluateAll((options) =>
         options.map((option) => (option as HTMLOptionElement).value),
       ),
-  ).toEqual([
+  ).toEqual(expect.arrayContaining([
     "en_paul_neutral",
     "en_paul_confident",
     "gb_oliver_neutral",
     "gb_oliver_confident",
     "gb_jane_neutral",
     "gb_jane_confident",
-  ]);
+    "voice_485", "voice_478", "voice_1788", "voice_1787", "voice_3153", "voice_3139",
+  ]));
+  await expect(select.locator("option")).toHaveCount(32);
+  await expect(select.locator("optgroup")).toHaveCount(22);
+  await expect(select.locator('optgroup[label="Hindi"] option')).toHaveCount(2);
+  await select.selectOption("voice_3139");
+  await expect(select.locator("option:checked")).toHaveText("Ananya · Hindi female");
+  await expect(page.getByLabel("Preset voice preview")).toHaveAttribute("src", /voice_3139/);
   await select.selectOption("gb_oliver_neutral");
   const audio = page.getByLabel("Preset voice preview");
   await expect(audio).toHaveAttribute("src", /gb_oliver_neutral/);

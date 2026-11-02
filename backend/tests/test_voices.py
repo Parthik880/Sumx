@@ -295,7 +295,8 @@ def test_long_narration_chunks(user_client, monkeypatch):
 
 def test_presets_and_separate_local_metrics(admin_client):
     catalog = admin_client.get("/api/voices/presets").json()
-    assert catalog["default"] == "en_paul_neutral" and len(catalog["voices"]) == 6
+    from backend.preset_voices import PRESETS
+    assert catalog["default"] == "en_paul_neutral" and len(catalog["voices"]) == len(PRESETS)
     with DB() as db:
         owner = db.scalar(select(User).where(User.role == "admin"))
         db.add(

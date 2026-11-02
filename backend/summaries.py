@@ -53,7 +53,11 @@ def audio_info(audio):
 def mode_status(db, meeting_id, mode, summary):
     job = db.scalar(
         select(Job)
-        .where(Job.meeting_id == meeting_id, Job.kind.in_(("pipeline", "summarize")))
+        .where(
+            Job.meeting_id == meeting_id,
+            Job.kind.in_(("pipeline", "summarize")),
+            func.coalesce(Job.payload["detail"].as_string(), db.get(Meeting, meeting_id).detail) == mode,
+        )
         .order_by(Job.created.desc())
     )
     current = bool(job and job.payload.get("detail", db.get(Meeting, meeting_id).detail) == mode)

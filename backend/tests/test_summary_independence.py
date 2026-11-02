@@ -19,7 +19,7 @@ class Router(MockRouter):
         content, data, response = super().summarize(text, detail, synthesis, **options)
         self.count += 1
         unique = {**content, "executive_summary": f"{detail} text {self.count}."}
-        return unique, data, response
+        return unique, {**data, "id": f"summary-{self.count}"}, response
 
     async def speech_async(self, text, voice, client):
         self.narrated.append(text)
@@ -89,14 +89,13 @@ def test_required_scenario_end_to_end(user_client, provider):
     assert standard.startswith("standard") and text(user_client, mid, "concise") == concise
     assert text(user_client, mid, "detailed") is None
 
-    generate(user_client, mid, "detailed", provider)
-    detailed = text(user_client, mid, "detailed")
-    assert text(user_client, mid, "concise") == concise and text(user_client, mid, "standard") == standard
-
     generate(user_client, mid, "standard", provider)
     replaced = text(user_client, mid, "standard")
     assert replaced != standard and replaced.startswith("standard")
-    assert text(user_client, mid, "concise") == concise and text(user_client, mid, "detailed") == detailed
+    assert text(user_client, mid, "concise") == concise and text(user_client, mid, "detailed") is None
+    generate(user_client, mid, "detailed", provider)
+    assert text(user_client, mid, "concise") == concise and text(user_client, mid, "standard") == replaced
+    assert provider.count == 4
     listed = user_client.get(f"/api/meetings/{mid}/summaries").json()
     assert listed["modes"]["standard"]["revision"] == 2 and listed["modes"]["concise"]["revision"] == 1
     assert listed["narration_options"] == ["concise", "standard", "detailed"]
@@ -129,6 +128,128 @@ def test_regenerate_always_calls_the_llm(user_client, provider):
     generate(user_client, mid, "concise", provider)
     generate(user_client, mid, "concise", provider)
     assert provider.count == 2
+
+
+def test_completed_attempt_is_idempotent_but_other_modes_have_own_scope(user_client, provider):
+    mid = new_meeting(user_client.user_id)
+    headers = {"Idempotency-Key": "same-generation-attempt-123"}
+    path = f"/api/meetings/{mid}/summaries/concise/generate"
+    first = user_client.post(path, json={}, headers=headers).json()["id"]
+    process_job(first, provider)
+    assert user_client.post(path, json={}, headers=headers).json()["id"] == first
+    process_job(first, provider)  # A duplicate delivery must also be harmless.
+    assert provider.count == 1
+    other = user_client.post(path.replace("concise", "standard"), json={}, headers=headers)
+    assert other.status_code == 200 and other.json()["id"] != first
+    process_job(other.json()["id"], provider)
+    assert provider.count == 2
+    with DB() as db:
+        from sqlalchemy import select
+        assert [r.detail for r in db.scalars(select(Summary).where(Summary.meeting_id == mid).order_by(Summary.version))] == ["concise", "standard"]
+
+
+def test_legacy_endpoint_cannot_return_a_conflicting_mode(user_client):
+    mid = new_meeting(user_client.user_id)
+    headers = {"Idempotency-Key": "legacy-conflict-attempt-123"}
+    first = user_client.post(f"/api/meetings/{mid}/summaries/concise/generate", json={}, headers=headers)
+    assert first.status_code == 200
+    other = user_client.post(f"/api/meetings/{mid}/summarize", json={"detail": "standard"}, headers=headers)
+    assert other.status_code == 409
+
+
+def test_concurrent_different_modes_are_serialized(user_client):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    from backend.jobs import enqueue, JobConflict
+    from sqlalchemy import select
+
+    mid = new_meeting(user_client.user_id)
+    barrier = threading.Barrier(2)
+
+    def queue(mode):
+        with DB() as db:
+            meeting = db.get(Meeting, mid)
+            barrier.wait(timeout=5)
+            try:
+                return enqueue(db, meeting, "summarize", "parallel-attempt-1234", {"detail": mode}).id
+            except JobConflict:
+                return None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(queue, ("concise", "standard")))
+    assert sum(result is not None for result in results) == 1
+    with DB() as db:
+        assert len(db.scalars(select(Job).where(Job.meeting_id == mid)).all()) == 1
+
+
+def test_concise_upload_only_generates_concise(user_client, provider):
+    from backend.tests.test_sumx import upload
+    from sqlalchemy import select
+
+    response = upload(user_client, detail="concise")
+    assert response.status_code == 200
+    mid = response.json()["id"]
+    assert response.json()["detail"] == "concise"
+    with DB() as db:
+        job = db.scalar(select(Job).where(Job.meeting_id == mid))
+        jid = job.id
+        assert job.payload["detail"] == "concise"
+    process_job(jid, provider)
+    assert provider.count == 1
+    assert text(user_client, mid, "concise").startswith("concise")
+    assert text(user_client, mid, "standard") is None and text(user_client, mid, "detailed") is None
+    with DB() as db:
+        assert len(db.scalars(select(Summary).where(Summary.meeting_id == mid)).all()) == 1
+        metrics = db.get(Job, jid).payload["summary_metrics"]
+        assert metrics["mode"] == "concise" and metrics["llm_calls"] == metrics["direct_calls"] == 1
+        assert metrics["records_saved"] == 1
+
+
+def test_long_concise_job_retries_only_failed_notes_and_keeps_mode(user_client, provider, monkeypatch):
+    from backend.config import settings
+    from backend.media import text_chunks
+    from backend.models import Usage
+    from backend.provider import ProviderError
+    from sqlalchemy import select
+
+    monkeypatch.setattr(settings, "summary_chunk_chars", 1500)
+    mid = new_meeting(user_client.user_id)
+    with DB() as db:
+        transcript = db.scalar(select(Transcript).where(Transcript.meeting_id == mid))
+        transcript.text = " ".join(f"Discussion item {i} concerns the library plan." for i in range(250))
+        db.commit()
+    response = user_client.post(f"/api/meetings/{mid}/summaries/concise/generate", json={},
+                               headers={"Idempotency-Key": "long-concise-attempt-123"})
+    jid = response.json()["id"]
+    calls = []
+    original = provider.summarize
+
+    def fail_once(text, mode, synthesis=False, **options):
+        calls.append((text, mode, synthesis, options))
+        if len(calls) == 2:
+            raise ProviderError("Temporary failure")
+        return original(text, mode, synthesis, **options)
+
+    provider.summarize = fail_once
+    process_job(jid, provider)
+    with DB() as db:
+        job = db.get(Job, jid)
+        assert job.state == "failed" and len(job.checkpoint["summary_parts"]) == 1
+    retried = user_client.post(f"/api/meetings/{mid}/jobs/{jid}/retry")
+    assert retried.status_code == 200
+    process_job(jid, provider)
+    assert sum(call[0] == calls[0][0] for call in calls) == 1
+    assert all(call[1] == "concise" for call in calls)
+    with DB() as db:
+        metrics = db.get(Job, jid).payload["summary_metrics"]
+        transcript = db.scalar(select(Transcript).where(Transcript.meeting_id == mid))
+        n = len(text_chunks(transcript.text, settings.summary_chunk_chars))
+        assert metrics["transcript_chunks"] == n
+        assert metrics["note_calls"] == n + 1 and metrics["synthesis_calls"] == 1
+        assert metrics["correction_calls"] == 0 and metrics["records_saved"] == 1
+        assert metrics["llm_calls"] == n + 2 == len(calls)
+        assert len(db.scalars(select(Usage).where(Usage.meeting_id == mid)).all()) == n + 1
+        assert [r.detail for r in db.scalars(select(Summary).where(Summary.meeting_id == mid))] == ["concise"]
 
 
 def test_narration_reads_the_selected_mode_not_the_newest(user_client, provider):

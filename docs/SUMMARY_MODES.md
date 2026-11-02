@@ -6,9 +6,9 @@
 
 Transcripts longer than `SUMMARY_CHUNK_CHARS` become notes first, and all notes then go into one final call that sets the length. Only very long meetings merge in groups, and notes are never split. If a response is cut off or malformed, it retries once with double the token budget, and both calls are recorded in the cost ledger. If a result is over 125% of target, one shortening pass runs. Summaries are never padded, so a short meeting can fall below target.
 
-Each summary stores its `detail` and `prompt_version`, which includes the prompt and model. Requesting the same mode for the same transcript, prompt and model reuses that summary with no LLM call. Older and hand-edited summaries have no mode and are not reused. Raise `PROMPT_VERSION` after changing a prompt.
+Each summary stores its `detail` and `prompt_version`, which includes the prompt and model. Viewing a saved mode never calls the LLM. Generate or Regenerate intentionally adds a revision only for its selected mode; retrying the same idempotency key returns the same job instead. Keys are scoped by meeting, mode and generation attempt. Raise `PROMPT_VERSION` after changing a prompt.
 
-Narration uses the meeting's current summary. Saved audio is matched on a hash of the spoken words, so another mode or older wording never matches, and returning to a mode reuses its audio.
+The narration selector uses the exact saved version of its chosen mode. Saved audio is matched on a hash of the spoken words, so different wording never matches, and returning to an unchanged mode reuses its audio.
 
 ## Spoken action items
 
@@ -46,6 +46,10 @@ Extraction takes about 0.5 s per 3-minute chunk and does not speed up with FFmpe
 ## Independent modes
 
 Concise, Standard and Detailed are three separate saved summaries. A mode's active summary is its newest `summaries` row with that `detail`; `backend/summaries.py` is the only place that decides this. Viewing never calls the LLM. Generate and Regenerate always do, and they add a row for that mode alone.
+
+Upload generates only its selected mode automatically after transcription; the form defaults to Standard and says so. Choosing Concise later does not delete that earlier Standard revision. Both summary POST routes share the same serialized enqueue/conflict checks. Mode switching and polling are read-only. Failed jobs resume their own successful notes, guarded by mode, transcript version and prompt identity.
+
+`Job.payload.summary_metrics` records `mode`, `transcript_chunks`, `note_calls`, `direct_calls`, `synthesis_calls`, `correction_calls`, total `llm_calls` and `records_saved`. Call counts include failed attempts and the bounded model-output correction/retry; resumed jobs retain their counts. Worker logs include job ID and mode, never transcript or note content. Multiple notes calls are work toward one mode, not independent summary generations. See [regional voices and isolation verification](REGIONAL_VOICES_AND_SUMMARY_ISOLATION.md) for measured regression cases.
 
 | Endpoint | Purpose |
 | --- | --- |

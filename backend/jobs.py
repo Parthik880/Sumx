@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import logging
 import threading
 import time
 from decimal import Decimal
@@ -21,6 +22,11 @@ from .speech_contract import PIPELINE_VERSION, split_narration
 from .clone_speech import PIPELINE as CLONE_PIPELINE, split_clone_narration
 
 ACTIVE = ("queued", "running")
+logger = logging.getLogger(__name__)
+
+
+class JobConflict(ValueError):
+    pass
 
 
 def latest(db, cls, meeting_id):
@@ -31,17 +37,31 @@ def enqueue(db, meeting, kind, request_key, payload=None):
     # Serialize enqueue/edit/delete for one meeting on both SQLite and PostgreSQL.
     db.execute(update(Meeting).where(Meeting.id == meeting.id).values(status=Meeting.status))
     db.refresh(meeting)
+    payload = dict(payload or {})
+    if kind in ("pipeline", "summarize"):
+        payload.setdefault("detail", meeting.detail)
+    if kind == "summarize":
+        # The same attempt ID in another mode must never return that mode's summary job.
+        legacy = db.scalar(select(Job).where(Job.meeting_id == meeting.id, Job.request_key == request_key))
+        if legacy and legacy.kind == kind and legacy.payload.get("detail", meeting.detail) == payload["detail"]:
+            return legacy
+        request_key = "summary:" + hashlib.sha256(f"{payload['detail']}:{request_key}".encode()).hexdigest()
     previous = db.scalar(select(Job).where(Job.meeting_id == meeting.id, Job.request_key == request_key))
     if previous:
         return previous
     active = db.scalar(select(Job).where(Job.meeting_id == meeting.id, Job.state.in_(ACTIVE)))
     if active:
+        if kind == "summarize" and not (
+            active.kind in ("summarize", "pipeline")
+            and active.payload.get("detail", meeting.detail) == payload["detail"]
+        ):
+            raise JobConflict("This meeting is busy. Try again when the current task finishes.")
         return active
     job = Job(
         meeting_id=meeting.id,
         kind=kind,
         request_key=request_key,
-        payload=payload or {},
+        payload=payload,
         user_id=meeting.user_id,
         voice_id=(payload or {}).get("cloned_voice_id"),
         model_name=settings.qwen_tts_model
@@ -164,6 +184,8 @@ def process_job(job_id, provider=None):
     try:
         with DB() as db:
             job = db.get(Job, job_id)
+            if job.state == "completed":
+                return
             if job.started_at is None:
                 job.started_at = time.time()
             meeting = db.get(Meeting, job.meeting_id)
@@ -266,6 +288,10 @@ def process_job(job_id, provider=None):
                 if not transcript:
                     raise ValueError("Create a transcript before requesting a summary")
                 detail = job.payload.get("detail", meeting.detail)
+                context = {"mode": detail, "transcript_version": transcript.version, "prompt": prompt_identity()}
+                if checkpoint.get("summary_context", context) != context:
+                    raise ValueError("Summary checkpoint does not match this mode, transcript and prompt")
+                checkpoint["summary_context"] = context
                 text = (
                     "\n".join(f"[{s['start']:.1f}s] {s['text']}" for s in transcript.segments)
                     if transcript.segments
@@ -276,6 +302,11 @@ def process_job(job_id, provider=None):
                     checkpoint["summary_parts"] = notes
                     job.checkpoint = dict(checkpoint)
                     progress(db, job, meeting, "summarizing", done, total)
+
+                def save_metrics(metrics):
+                    job.payload = {**job.payload, "summary_metrics": dict(metrics)}
+                    db.commit()
+                    logger.info("summary_call job=%s mode=%s metrics=%s", job.id, detail, metrics)
 
                 progress(db, job, meeting, "summarizing", 0, 1)
                 content, metrics = build_summary(
@@ -288,6 +319,8 @@ def process_job(job_id, provider=None):
                     transcript_words=len(transcript.text.split()),
                     parts=checkpoint.get("summary_parts", []),
                     on_part=save_notes,
+                    metrics=job.payload.get("summary_metrics"),
+                    on_metrics=save_metrics,
                 )
                 job.payload = {**job.payload, "summary_metrics": metrics}
                 meeting.summary_version += 1
@@ -308,8 +341,11 @@ def process_job(job_id, provider=None):
                     meeting.title = content["title"]
                 checkpoint["summary_done"] = True
                 checkpoint.pop("summary_parts", None)
+                metrics["records_saved"] = 1
+                job.payload = {**job.payload, "summary_metrics": metrics}
                 job.checkpoint = dict(checkpoint)
                 db.commit()
+                logger.info("summary_saved job=%s mode=%s version=%s metrics=%s", job.id, detail, meeting.summary_version, metrics)
             if job.kind == "speech":
                 summary = db.scalar(
                     select(Summary).where(
@@ -587,4 +623,5 @@ def run_worker(stop=None):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     run_worker()

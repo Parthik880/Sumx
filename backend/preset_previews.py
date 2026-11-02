@@ -11,9 +11,8 @@ from .config import settings
 from .jobs import account
 from .media import probe
 from .models import DB, User
-from .preset_voices import PRESETS
+from .preset_voices import PRESETS, preview_text
 from .provider import OpenRouter
-from .speech_contract import PREVIEW_TEXT
 from .voice_catalog import preset_id, preview_file
 
 
@@ -29,7 +28,8 @@ def generate(voice, router):
     target = preview_file(voice)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(".pending.mp3")
-    audio, data, response = router.speech(PREVIEW_TEXT, voice)
+    text = preview_text(voice)
+    audio, data, response = router.speech(text, voice)
     temporary.write_bytes(audio)
     try:
         seconds = probe(temporary)[0]
@@ -45,7 +45,7 @@ def generate(voice, router):
                 response,
                 user_id=ledger_owner(db),
                 voice_type="preset",
-                input_characters=len(PREVIEW_TEXT),
+                input_characters=len(text),
                 purpose="preset_preview",
             )
         temporary.replace(target)
@@ -63,6 +63,11 @@ def main():
     router = OpenRouter()
     failed = []
     try:
+        data = router.json(router.request("GET", "/models?output_modalities=speech"))
+        model = next((m for m in data.get("data", []) if m.get("id") == settings.openrouter_tts_model), {})
+        unsupported = set(voices) - set(model.get("supported_voices", []))
+        if unsupported:
+            raise ValueError(f"Preview voices not supported by the configured OpenRouter model: {sorted(unsupported)}")
         for voice in voices:
             if preview_file(voice).is_file() and not args.refresh:
                 print(f"{voice}: exists, skipped", flush=True)

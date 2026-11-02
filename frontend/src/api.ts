@@ -61,6 +61,7 @@ export type Meeting = {
   transcript_version: number;
   summary_version: number;
   retain_source: boolean;
+  detail: SummaryMode;
   source_available?: boolean;
   media_type?: string;
   transcript?: {
@@ -142,11 +143,11 @@ export async function api<T = any>(
   }
   return response.json();
 }
-export function post<T = any>(path: string, data: unknown = {}) {
+export function post<T = any>(path: string, data: unknown = {}, key: string = crypto.randomUUID()) {
   return api<T>(path, {
     method: "POST",
     body: JSON.stringify(data),
-    headers: { "Idempotency-Key": crypto.randomUUID() },
+    headers: { "Idempotency-Key": key },
   });
 }
 export function upload(
