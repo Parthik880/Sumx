@@ -48,7 +48,7 @@ class MockRouter:
         self.calls = []
         self.fail_summary = fail_summary
 
-    def async_client(self):
+    def async_client(self, **options):
         return httpx.AsyncClient()
 
     async def transcribe_async(self, path, language, client):
@@ -378,7 +378,9 @@ def test_chunk_checkpoint_and_worker_restart(user_client, monkeypatch):
     provider.transcribe = fail_second
     process_job(job_id, provider)
     with DB() as db:
-        assert len(db.get(Job, job_id).checkpoint["stt_parts"]) >= 1
+        from backend.models import SttChunk
+
+        assert list(db.scalars(select(SttChunk).where(SttChunk.job_id == job_id)))
     # Resume only the missing chunk, including its source offset.
     provider.transcribe = original
     user_client.post(f"/api/meetings/{m_id}/jobs/{job_id}/retry")

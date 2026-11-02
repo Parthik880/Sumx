@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+﻿import { test, expect } from "@playwright/test";
 
 test("live segment progress, refresh reconnect, no premature 100%, failure and retry", async ({
   page,
@@ -16,7 +16,7 @@ test("live segment progress, refresh reconnect, no premature 100%, failure and r
     started = false,
     reads = 0,
     retries = 0;
-  await page.route("**/api/meetings/*/speech", async (route) => {
+  await page.route("**/api/meetings/*/narrations", async (route) => {
     started = true;
     await route.continue();
   });

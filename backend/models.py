@@ -9,6 +9,7 @@ from sqlalchemy import (
     Integer,
     Index,
     JSON,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -106,7 +107,10 @@ class Transcript(Base):
 
 class Summary(Base):
     __tablename__ = "summaries"
-    __table_args__ = (UniqueConstraint("meeting_id", "version"),)
+    __table_args__ = (
+        UniqueConstraint("meeting_id", "version"),
+        Index("ix_summaries_meeting_detail_version", "meeting_id", "detail", "version"),
+    )
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=uid)
     meeting_id: Mapped[str] = mapped_column(ForeignKey("meetings.id"), index=True)
     version: Mapped[int] = mapped_column(Integer)
@@ -155,6 +159,41 @@ class Job(Base):
     completed_at: Mapped[float | None] = mapped_column(Float)
     output_path: Mapped[str | None] = mapped_column(Text)
     audio_seconds: Mapped[float] = mapped_column(Float, default=0)
+
+
+class SttChunk(Base):
+    """One finished part of a transcription job. Text is cleared once the transcript is saved."""
+
+    __tablename__ = "stt_chunks"
+    __table_args__ = (UniqueConstraint("job_id", "chunk_index"),)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=uid)
+    job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"))
+    meeting_id: Mapped[str] = mapped_column(ForeignKey("meetings.id", ondelete="CASCADE"), index=True)
+    chunk_index: Mapped[int] = mapped_column(Integer)
+    offset_seconds: Mapped[float] = mapped_column(Float)
+    text: Mapped[str] = mapped_column(Text)
+    segments: Mapped[list] = mapped_column(JSON, default=list)
+    language: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="completed")
+    request_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    cost: Mapped[Decimal | None] = mapped_column(Numeric(18, 9), nullable=True)
+    cost_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    created: Mapped[float] = mapped_column(Float, default=time.time)
+
+
+class SttLease(Base):
+    __tablename__ = "stt_leases"
+    slot: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    owner: Mapped[str] = mapped_column(String(32))
+    expires: Mapped[float] = mapped_column(Float)
+
+
+class SttState(Base):
+    __tablename__ = "stt_state"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    level: Mapped[int] = mapped_column(Integer)
+    updated: Mapped[float] = mapped_column(Float)
+    control: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class Usage(Base):

@@ -2,6 +2,8 @@ import asyncio
 import json
 import random
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from decimal import Decimal
 import httpx
 from .config import settings
@@ -64,10 +66,41 @@ def summary_token_budget(words):
 
 
 class ProviderError(Exception):
-    def __init__(self, message, response=None, retryable=False):
+    def __init__(self, message, response=None, retryable=False, kind=None, retry_after=None):
         super().__init__(message)
         self.response = response
         self.retryable = retryable
+        self.kind = kind
+        self.retry_after = retry_after
+
+
+def transcription_failure(response):
+    """What a failed response means. Only a 402 naming the in-flight budget is temporary."""
+    status = response.status_code
+    if status == 429:
+        return "rate_limit"
+    if status == 402:
+        try:
+            body = response.json()
+            error = body.get("error", {})
+            metadata = error.get("metadata", {}) if isinstance(error, dict) else {}
+            return "in_flight" if metadata.get("limit_source") == "openrouter_in_flight_budget" and retry_after(response) is not None else "credits"
+        except (ValueError, AttributeError):
+            return "credits"
+    if status in (502, 503, 504):
+        return "server"
+    return "fatal"
+
+
+def retry_after(response):
+    value = response.headers.get("retry-after", "")
+    try:
+        return max(0, float(value))
+    except ValueError:
+        try:
+            return max(0, (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds())
+        except (ValueError, TypeError, OverflowError):
+            return None
 
 
 class OpenRouter:
@@ -76,14 +109,14 @@ class OpenRouter:
         self.async_transport = async_transport
         self._speech_rate = None
 
-    def async_client(self):
+    def async_client(self, *, capacity=None):
         """One pooled client per transcription job, shared by all of its chunks."""
         return httpx.AsyncClient(
             transport=self.async_transport,
             timeout=httpx.Timeout(120, connect=15, pool=30),
             limits=httpx.Limits(
-                max_connections=settings.stt_concurrency,
-                max_keepalive_connections=settings.stt_concurrency,
+                max_connections=capacity or settings.preset_tts_concurrency,
+                max_keepalive_connections=capacity or settings.preset_tts_concurrency,
             ),
             follow_redirects=False,
         )
@@ -183,46 +216,55 @@ class OpenRouter:
             raise ProviderError("OPENROUTER_API_KEY is not configured on the server")
         url = settings.openrouter_base_url.rstrip("/") + "/audio/transcriptions"
         headers = {"Authorization": "Bearer " + settings.openrouter_api_key, "X-Title": "SUMX"}
-        retries, backoff = 0, 0.0
-        while True:
-            marks = {"start": time.perf_counter()}
+        marks = {"start": time.perf_counter()}
 
-            async def trace(name, info):
-                marks.setdefault(name, time.perf_counter())
+        async def trace(name, info):
+            marks.setdefault(name, time.perf_counter())
 
-            try:
-                with path.open("rb") as file:
-                    response = await client.post(
-                        url,
-                        headers=headers,
-                        data=self.transcription_params(language),
-                        files={"file": (path.name, file, "audio/mpeg")},
-                        extensions={"trace": trace},
-                    )
-                error = None
-            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
-                # The request never reached the provider, so a retry cannot double-charge.
-                response, error = None, exc
-            except httpx.TransportError as exc:
-                # An ambiguous timeout may already have been billed. Resuming retries this chunk.
-                raise ProviderError("OpenRouter connection failed; retry may incur another charge") from exc
-            if error is None and response.status_code not in RETRYABLE_STATUS:
-                break
-            if retries >= STT_ATTEMPTS - 1:
-                if error is not None:
-                    raise ProviderError("OpenRouter is temporarily unavailable") from error
-                break
-            after = response.headers.get("retry-after") if response is not None else None
-            delay = min(30.0, 2.0**retries) + random.uniform(0, 0.5)
-            if after and after.replace(".", "", 1).isdigit():
-                delay = min(60.0, max(delay, float(after)))
-            retries, backoff = retries + 1, backoff + delay
-            await asyncio.sleep(delay)
-        if not response.is_success:
-            if response.status_code == 401:
-                await asyncio.to_thread(self.check_key)
+        try:
+            with path.open("rb") as file:
+                response = await client.post(
+                    url,
+                    headers=headers,
+                    data=self.transcription_params(language),
+                    files={"file": (path.name, file, "audio/mpeg")},
+                    extensions={"trace": trace},
+                )
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            # The request never reached the provider, so a retry cannot double-charge.
             raise ProviderError(
-                f"OpenRouter rejected the request (HTTP {response.status_code}). Check model, credits and configuration."
+                "OpenRouter is temporarily unavailable", kind="network", retryable=True
+            ) from exc
+        except httpx.TransportError as exc:
+            # The provider may have finished and billed this request.
+            raise ProviderError(
+                "OpenRouter connection failed; retry may incur another charge",
+                kind="ambiguous",
+                retryable=True,
+            ) from exc
+        if not response.is_success:
+            kind = transcription_failure(response)
+            if kind == "credits":
+                raise ProviderError(
+                    "OpenRouter reports insufficient credits or a reached spending limit (HTTP 402). "
+                    "Add credits or raise the key limit, then resume transcription.",
+                    response=response,
+                    kind=kind,
+                )
+            if kind == "fatal":
+                if response.status_code == 401:
+                    await asyncio.to_thread(self.check_key)
+                raise ProviderError(
+                    f"OpenRouter rejected the request (HTTP {response.status_code}). Check model, credits and configuration.",
+                    response=response,
+                    kind=kind,
+                )
+            raise ProviderError(
+                f"OpenRouter is temporarily unavailable (HTTP {response.status_code})",
+                response=response,
+                kind=kind,
+                retryable=True,
+                retry_after=retry_after(response),
             )
         finished = time.perf_counter()
         sent = marks.get("http11.send_request_body.complete", marks["start"])
@@ -236,8 +278,6 @@ class OpenRouter:
                 "upload_seconds": sent - marks["start"],
                 "provider_seconds": headers_at - sent,
                 "download_seconds": finished - headers_at,
-                "retries": retries,
-                "backoff_seconds": backoff,
             },
         )
 

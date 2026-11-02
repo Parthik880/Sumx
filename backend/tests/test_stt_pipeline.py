@@ -14,7 +14,7 @@ from backend.services.stt_pipeline import chunk_plan, merge_parts, strip_repeat,
 @pytest.fixture
 def fast(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
-    monkeypatch.setattr(settings, "stt_concurrency", 3)
+    monkeypatch.setattr(settings, "stt_initial_concurrency", 3)
     monkeypatch.setattr(asyncio, "sleep", _no_sleep)
 
     def fake_extract(source, target, offset, duration):
@@ -103,15 +103,16 @@ def test_only_rate_limited_chunk_retries_and_is_counted(fast):
     assert stats["retries"] == 2 and stats["backoff_seconds"] > 0
 
 
-def test_ambiguous_timeout_is_not_retried_automatically(fast):
+def test_ambiguous_timeout_retries_once_and_is_counted(fast):
     calls = []
 
     def handler(request):
         calls.append(1)
         raise httpx.ReadTimeout("slow", request=request)
 
-    _, _, _, error = run(router_for(handler), fast, 180)
-    assert isinstance(error, ProviderError) and "another charge" in str(error) and len(calls) == 1
+    _, _, stats, error = run(router_for(handler), fast, 180)
+    assert isinstance(error, ProviderError) and "resume transcription" in str(error)
+    assert len(calls) == 2 and stats["ambiguous_timeouts"] == 2
 
 
 def test_connection_failure_retries_because_nothing_was_sent(fast):

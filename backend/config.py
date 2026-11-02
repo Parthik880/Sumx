@@ -46,7 +46,19 @@ class Settings(BaseSettings):
     openrouter_stt_timestamps: bool = True
     summary_chunk_chars: int = 24000
     audio_chunk_seconds: int = 180
-    stt_concurrency: int = Field(default=4, ge=1, le=8)
+    stt_adaptive: bool = True
+    stt_initial_concurrency: int = Field(default=2, ge=1, le=12)
+    stt_max_concurrency: int = Field(default=12, ge=1, le=12)
+    stt_concurrency_levels: list[int] = [12, 10, 8, 6, 4, 2, 1]
+    stt_min_concurrency: int = Field(default=1, ge=1)
+    # Shared by every meeting in every worker.
+    stt_global_concurrency: int = Field(default=12, ge=1, le=64)
+    stt_extract_concurrency: int = Field(default=2, ge=1, le=4)
+    stt_chunk_attempts: int = Field(default=6, ge=1, le=12)
+    stt_ambiguous_retries: int = Field(default=1, ge=0, le=3)
+    stt_job_deadline_seconds: int = Field(default=1800, ge=60)
+    stt_increase_successes: int = Field(default=12, ge=1)
+    stt_increase_cooldown_seconds: int = Field(default=60, ge=0)
     stt_overlap_seconds: float = Field(default=1.5, ge=0, le=5)
     max_upload_mb: int = Field(default=0, ge=0)
     max_duration_seconds: int = 14400
@@ -57,6 +69,13 @@ class Settings(BaseSettings):
     def validate_frontend_origin(self):
         from .preset_voices import PRESETS
         from .speech_contract import BASE_MODEL
+
+        if not self.stt_min_concurrency <= self.stt_initial_concurrency <= self.stt_max_concurrency:
+            raise ValueError("STT concurrency must satisfy min <= initial <= max")
+        if not self.stt_concurrency_levels or any(
+            not isinstance(n, int) or n < 1 or n > 12 for n in self.stt_concurrency_levels
+        ):
+            raise ValueError("STT concurrency levels must be integers between 1 and 12")
 
         if self.qwen_tts_model != BASE_MODEL:
             raise ValueError("Use Qwen3-TTS 0.6B Base for cloned voices")

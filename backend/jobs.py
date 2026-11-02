@@ -7,13 +7,14 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from .config import settings
 from .media import probe, run, safe_path
-from .models import AudioOutput, ClonedVoice, DB, Job, Meeting, Summary, Transcript, Usage
+from .models import AudioOutput, ClonedVoice, DB, Job, Meeting, Summary, Transcript, Usage, SttChunk
 from .provider import OpenRouter, ProviderError
 from .schema import spoken_text
 from .money import usd
 from . import tts_queue
 from .services.preset_tts import generate_preset
 from .summary_modes import build_summary, prompt_identity
+from .services.stt_control import GlobalBudget, preferred_level
 from .services.stt_pipeline import chunk_plan, merge_parts, transcribe_chunks
 from .preset_voices import PRESETS
 from .speech_contract import PIPELINE_VERSION, split_narration
@@ -107,7 +108,7 @@ def account(
             if generation_status != "succeeded":
                 existing.generation_status = generation_status
             db.commit()
-            return
+            return existing
     usage = Usage(
         meeting_id=meeting.id if meeting else None,
         user_id=meeting.user_id if meeting else user_id,
@@ -142,6 +143,7 @@ def account(
             db.add(usage)
             db.flush()
         db.commit()
+        return usage
     except IntegrityError:
         # Another worker already recorded this provider request; do not charge it twice.
         if not key or not db.scalar(select(Usage.id).where(Usage.billing_key == key)):
@@ -176,11 +178,33 @@ def process_job(job_id, provider=None):
                 parts = {int(k): v for k, v in checkpoint.get("stt_parts", {}).items()}
                 for index, part in enumerate(checkpoint.get("transcription_parts", [])):
                     parts.setdefault(index, {**part, "offset": index * settings.audio_chunk_seconds})
+                for row in db.scalars(select(SttChunk).where(SttChunk.job_id == job.id)):
+                    parts[row.chunk_index] = {
+                        "text": row.text,
+                        "segments": row.segments,
+                        "language": row.language,
+                        "offset": row.offset_seconds,
+                    }
                 n = len(chunk_plan(meeting.duration))
                 progress(db, job, meeting, "transcribing", len(parts), n)
 
                 def save_part(chunk, part, data, response, seconds):
-                    account(
+                    row = SttChunk(
+                        job_id=job.id,
+                        meeting_id=meeting.id,
+                        chunk_index=chunk["index"],
+                        offset_seconds=chunk["offset"],
+                        text=part["text"],
+                        segments=part["segments"],
+                        language=part.get("language"),
+                        request_id=response.headers.get("x-request-id")
+                        or data.get("id")
+                        or response.headers.get("x-generation-id"),
+                    )
+                    db.add(row)
+                    # The chunk and its ledger row commit together, so neither can exist alone.
+                    db.flush()
+                    charge = account(
                         db,
                         meeting,
                         "stt",
@@ -190,8 +214,8 @@ def process_job(job_id, provider=None):
                         audio_seconds=seconds,
                     )
                     parts[chunk["index"]] = part
-                    checkpoint["stt_parts"] = {str(k): v for k, v in parts.items()}
-                    job.checkpoint = dict(checkpoint)
+                    if charge:
+                        row.cost, row.cost_status = charge.cost, charge.cost_status
                     progress(db, job, meeting, "transcribing", len(parts), n)
 
                 stats = {}
@@ -206,6 +230,8 @@ def process_job(job_id, provider=None):
                             parts,
                             save_part,
                             stats,
+                            budget=GlobalBudget(job.id),
+                            start=preferred_level(),
                         )
                     )
                 finally:
@@ -229,6 +255,7 @@ def process_job(job_id, provider=None):
                 checkpoint.pop("stt_parts", None)
                 checkpoint.pop("transcription_parts", None)
                 job.checkpoint = dict(checkpoint)
+                db.execute(update(SttChunk).where(SttChunk.job_id == job.id).values(text="", segments=[]))
                 db.commit()
                 if not meeting.retain_source:
                     source.unlink(missing_ok=True)
@@ -475,7 +502,7 @@ def process_job(job_id, provider=None):
         with DB() as db:
             job = db.get(Job, job_id)
             if job:
-                if isinstance(exc, ProviderError) and exc.response is not None:
+                if isinstance(exc, ProviderError) and exc.response is not None and not exc.kind:
                     context = {
                         "transcribing": ("stt", settings.openrouter_stt_model),
                         "summarizing": ("llm", settings.openrouter_summary_model),

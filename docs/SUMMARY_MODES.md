@@ -42,3 +42,17 @@ Every owner and deadline in the checked summaries appeared in the transcript. Th
 ## Media conversion
 
 Extraction takes about 0.5 s per 3-minute chunk and does not speed up with FFmpeg threads, so threading was left unchanged. Transcription is covered in the [speech guide](MODAL_TTS.md).
+
+## Independent modes
+
+Concise, Standard and Detailed are three separate saved summaries. A mode's active summary is its newest `summaries` row with that `detail`; `backend/summaries.py` is the only place that decides this. Viewing never calls the LLM. Generate and Regenerate always do, and they add a row for that mode alone.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/meetings/{id}/summaries` | State of all three modes, without content |
+| `GET /api/meetings/{id}/summaries/{mode}` | One mode's record and its narrations; `exists: false` if never generated |
+| `POST /api/meetings/{id}/summaries/{mode}/generate` | Generate or regenerate that mode |
+| `GET /api/meetings/{id}/narration-options` | Modes that can be narrated |
+| `POST /api/meetings/{id}/narrations` | Narrate a saved mode, using `summary_mode` |
+
+Narration belongs to the summary version it was made from, so regenerating one mode retires only that mode's audio. Summaries older than this change were assigned a mode by migration `0012` only where job history proves it. Any other stays blank, is shown as "Earlier summary, mode not recorded", and cannot be narrated.
