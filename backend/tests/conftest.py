@@ -11,6 +11,13 @@ os.environ["COOKIE_SECURE"] = "false"
 os.environ["MAX_UPLOAD_MB"] = "0"
 os.environ["OPENROUTER_API_KEY"] = "test-not-a-real-key"
 os.environ["GOOGLE_CLIENT_ID"] = "test-client.apps.googleusercontent.com"
+# Tests exercise their own concurrency policies, independent of local account tuning.
+os.environ["STT_INITIAL_CONCURRENCY"] = "2"
+os.environ["STT_MIN_CONCURRENCY"] = "1"
+os.environ["STT_MAX_CONCURRENCY"] = "12"
+os.environ["STT_GLOBAL_CONCURRENCY"] = "12"
+os.environ["STT_CONCURRENCY_LEVELS"] = "[12,10,8,6,4,2,1]"
+os.environ["STT_ADAPTIVE"] = "true"
 
 from fastapi.testclient import TestClient
 from backend.main import app

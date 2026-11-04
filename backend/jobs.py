@@ -1,8 +1,10 @@
 import asyncio
 import hashlib
+import json
 import logging
 import threading
 import time
+from copy import deepcopy
 from decimal import Decimal
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -10,7 +12,7 @@ from .config import settings
 from .media import probe, run, safe_path
 from .models import AudioOutput, ClonedVoice, DB, Job, Meeting, Summary, Transcript, Usage, SttChunk
 from .provider import OpenRouter, ProviderError
-from .schema import spoken_text
+from .schema import Minutes, spoken_text
 from .money import usd
 from . import tts_queue
 from .services.preset_tts import generate_preset
@@ -27,6 +29,10 @@ logger = logging.getLogger(__name__)
 
 class JobConflict(ValueError):
     pass
+
+
+class SummaryAlreadySaved(Exception):
+    """Another delivery finished this summary while this worker was awaiting its provider."""
 
 
 def latest(db, cls, meeting_id):
@@ -279,6 +285,11 @@ def process_job(job_id, provider=None):
                 job.checkpoint = dict(checkpoint)
                 db.execute(update(SttChunk).where(SttChunk.job_id == job.id).values(text="", segments=[]))
                 db.commit()
+                logger.info("transcription_completed %s", json.dumps({
+                    "job_id": job.id, "finished_at": time.time(),
+                    "transcription_seconds": stats.get("total_seconds"),
+                    "chunks": stats.get("completed_chunks"), "transcript_version": meeting.transcript_version,
+                }))
                 if not meeting.retain_source:
                     source.unlink(missing_ok=True)
                     meeting.original_path = None
@@ -299,30 +310,71 @@ def process_job(job_id, provider=None):
                 )
 
                 def save_notes(notes, done, total):
+                    ensure_not_saved()
                     checkpoint["summary_parts"] = notes
                     job.checkpoint = dict(checkpoint)
-                    progress(db, job, meeting, "summarizing", done, total)
+                    db.commit()
+
+                def ensure_not_saved():
+                    # Hold the writer lock through the following checkpoint/metrics commit.
+                    result = db.execute(update(Job).where(Job.id == job.id, Job.state != "completed")
+                                        .values(heartbeat=time.time()))
+                    if not result.rowcount:
+                        db.rollback()
+                        raise SummaryAlreadySaved()
 
                 def save_metrics(metrics):
-                    job.payload = {**job.payload, "summary_metrics": dict(metrics)}
+                    ensure_not_saved()
+                    job.payload = {**job.payload, "summary_metrics": deepcopy(metrics)}
                     db.commit()
-                    logger.info("summary_call job=%s mode=%s metrics=%s", job.id, detail, metrics)
 
-                progress(db, job, meeting, "summarizing", 0, 1)
-                content, metrics = build_summary(
-                    router,
-                    text,
-                    detail,
-                    lambda data, response: account(
-                        db, meeting, "llm", settings.openrouter_summary_model, data, response
-                    ),
-                    transcript_words=len(transcript.text.split()),
-                    parts=checkpoint.get("summary_parts", []),
-                    on_part=save_notes,
-                    metrics=job.payload.get("summary_metrics"),
-                    on_metrics=save_metrics,
-                )
-                job.payload = {**job.payload, "summary_metrics": metrics}
+                def summary_progress(stage, done, total):
+                    ensure_not_saved()
+                    previous = job.payload.get("summary_progress") or {}
+                    now = time.time()
+                    stage_started = previous.get("stage_started_at", now) if previous.get("stage") == stage else now
+                    job.payload = {**job.payload, "summary_progress": {
+                        "stage": stage, "stage_started_at": stage_started,
+                        "updated_at": now, "completed": min(done, total - 1), "total": total,
+                    }}
+                    job.stage, meeting.status = stage, "summarizing"
+                    job.completed, job.total, job.heartbeat = min(done, total - 1), total, now
+                    job.checkpoint = dict(checkpoint)
+                    db.commit()
+                    logger.info("summary_stage %s", json.dumps({"job_id": job.id, "mode": detail,
+                                "stage": stage, "completed": job.completed, "total": total,
+                                "started_at": stage_started, "at": now}))
+
+                if checkpoint.get("summary_result"):
+                    content = Minutes.model_validate(checkpoint["summary_result"]).model_dump()
+                    metrics = dict(job.payload.get("summary_metrics") or {})
+                    units = metrics.get("work_total", 3)
+                    summary_progress("summary_saving", units - 1, units)
+                else:
+                    content, metrics = build_summary(
+                        router, text, detail,
+                        lambda data, response: account(
+                            db, meeting, "llm", settings.openrouter_summary_model, data, response,
+                            generation_status="invalid_response" if data.get("_sumx_invalid_response") else "succeeded",
+                        ),
+                        transcript_words=len(transcript.text.split()),
+                        parts=checkpoint.get("summary_parts", []), on_part=save_notes,
+                        metrics={**(job.payload.get("summary_metrics") or {}), "job_id": job.id}, on_metrics=save_metrics,
+                        on_stage=summary_progress,
+                    )
+                    ensure_not_saved()
+                    checkpoint["summary_result"] = content
+                    job.checkpoint = dict(checkpoint)
+                    job.payload = {**job.payload, "summary_metrics": deepcopy(metrics)}
+                    db.commit()
+                saving_started = time.perf_counter()
+                # Serialize the final save and recheck after obtaining the writer lock.
+                db.execute(update(Job).where(Job.id == job.id).values(heartbeat=time.time()))
+                db.refresh(job)
+                if job.state == "completed" or job.checkpoint.get("summary_done"):
+                    return
+                db.refresh(meeting)
+                job.payload = {**job.payload, "summary_metrics": deepcopy(metrics)}
                 meeting.summary_version += 1
                 if not transcript.segments:
                     for action in content["action_items"]:
@@ -339,13 +391,22 @@ def process_job(job_id, provider=None):
                 )
                 if meeting.title == "Untitled meeting":
                     meeting.title = content["title"]
-                checkpoint["summary_done"] = True
-                checkpoint.pop("summary_parts", None)
                 metrics["records_saved"] = 1
-                job.payload = {**job.payload, "summary_metrics": metrics}
-                job.checkpoint = dict(checkpoint)
+                job.payload = {**job.payload, "summary_metrics": deepcopy(metrics)}
+                job.state, job.stage, job.completed_at = "completed", "completed", time.time()
+                job.completed = job.total
+                job.checkpoint = {}
+                meeting.status, meeting.error = "ready", None
+                # The saved Summary and completed/100% job become visible in this same transaction.
                 db.commit()
-                logger.info("summary_saved job=%s mode=%s version=%s metrics=%s", job.id, detail, meeting.summary_version, metrics)
+                metrics["timings"] = {**metrics.get("timings", {}), "database_save_seconds": time.perf_counter() - saving_started}
+                metrics["saved_at"] = time.time()
+                job.payload = {**job.payload, "summary_metrics": deepcopy(metrics)}
+                db.commit()
+                logger.info("summary_saved %s", json.dumps({"job_id": job.id, "mode": detail,
+                            "version": meeting.summary_version, "saved_at": metrics["saved_at"],
+                            "timings": metrics["timings"], "records_saved": 1}))
+                return
             if job.kind == "speech":
                 summary = db.scalar(
                     select(Summary).where(
@@ -534,16 +595,23 @@ def process_job(job_id, provider=None):
             meeting.status = "ready"
             meeting.error = None
             db.commit()
+    except SummaryAlreadySaved:
+        return
     except Exception as exc:
         with DB() as db:
             job = db.get(Job, job_id)
             if job:
-                if isinstance(exc, ProviderError) and exc.response is not None and not exc.kind:
+                if job.kind in ("pipeline", "summarize") and job.state == "completed":
+                    logger.exception("summary_post_save_telemetry_failed job_id=%s; saved summary remains completed", job.id)
+                    return
+                if isinstance(exc, ProviderError) and exc.response is not None and not exc.kind and not getattr(exc, "summary_accounted", False):
                     context = {
                         "transcribing": ("stt", settings.openrouter_stt_model),
                         "summarizing": ("llm", settings.openrouter_summary_model),
                         "generating_speech": ("tts", speech_model),
                     }.get(job.stage)
+                    if job.kind in ("pipeline", "summarize") and job.stage.startswith("summary_"):
+                        context = ("llm", settings.openrouter_summary_model)
                     if context:
                         try:
                             data = exc.response.json(parse_float=Decimal)

@@ -1,7 +1,10 @@
 import re
+import math
 import secrets
 import shutil
 import time
+import json
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -29,7 +32,7 @@ from . import summaries
 from .jobs import ACTIVE, JobConflict, enqueue, latest
 from .media import EXTENSIONS, MIMES, probe, safe_path, signature_ok
 from .limits import BodyLimitMiddleware
-from .models import AllowedEmail, AudioOutput, Job, Meeting, Session, Summary, Transcript, Usage, User, get_db
+from .models import AllowedEmail, AudioOutput, Job, Meeting, Session, SttState, Summary, Transcript, Usage, User, get_db
 from .provider import OpenRouter, ProviderError
 from .schema import Minutes, SpeechRequest, SummaryRequest, spoken_text
 from .voices import router as voices_router, owned as owned_voice, lock_user
@@ -56,6 +59,7 @@ async def lifespan(app):
 
 
 app = FastAPI(title="SUMX", lifespan=lifespan)
+summary_api_log = logging.getLogger("uvicorn.error")
 
 
 @app.exception_handler(JobConflict)
@@ -78,7 +82,7 @@ app.add_middleware(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.app_url],
+    allow_origins=settings.frontend_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Content-Type", "X-CSRF-Token", "Idempotency-Key"],
@@ -87,6 +91,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def security_headers(request, call_next):
+    retrieval_started = time.perf_counter()
     if (
         settings.max_upload_mb > 0
         and request.headers.get("content-length", "").isdigit()
@@ -94,6 +99,13 @@ async def security_headers(request, call_next):
     ):
         return JSONResponse({"detail": "Upload exceeds the server limit"}, status_code=413)
     response = await call_next(request)
+    if request.method == "GET" and re.fullmatch(r"/api/meetings/[^/]+(?:/status|/summaries(?:/[^/]+)?)?", request.url.path):
+        server_ms = (time.perf_counter() - retrieval_started) * 1000
+        response.headers["X-SUMX-Server-Ms"] = f"{server_ms:.3f}"
+        summary_api_log.info("summary_retrieval %s", json.dumps({
+            "path": request.url.path, "server_ms": server_ms, "status": response.status_code,
+            "response_bytes": response.headers.get("content-length"), "at": time.time(),
+        }))
     response.headers.update(
         {
             "X-Content-Type-Options": "nosniff",
@@ -269,15 +281,35 @@ def brief(m):
     }
 
 
-def job_info(job):
-    return (
-        {
-            k: getattr(job, k)
-            for k in ["id", "kind", "state", "stage", "completed", "total", "error", "created"]
+def job_info(job, db=None):
+    if not job:
+        return None
+    info = {
+        k: getattr(job, k)
+        for k in ["id", "kind", "state", "stage", "completed", "total", "error", "created"]
+    }
+    info["retry_after_seconds"] = 0
+    now = time.time()
+    info.update(started_at=job.started_at, completed_at=job.completed_at,
+                elapsed_seconds=max(0, (job.completed_at or now) - (job.started_at or job.created)),
+                progress_percent=100 if job.state == "completed" else min(99, int(100 * job.completed / job.total)) if job.total else 0)
+    metrics = job.payload.get("summary_metrics") or {}
+    if job.kind in ("pipeline", "summarize") and metrics:
+        info["summary_progress"] = {
+            **(job.payload.get("summary_progress") or {}),
+            "mode": metrics.get("mode"), "notes_completed": metrics.get("notes_completed", 0),
+            "notes_total": metrics.get("transcript_chunks", 0),
+            "note_concurrency": metrics.get("note_concurrency"),
+            "timings": metrics.get("timings", {}), "saved_at": metrics.get("saved_at"),
         }
-        if job
-        else None
-    )
+        info["summary_retry_after_seconds"] = math.ceil(max(0, metrics.get("retry_until", 0) - now)) if job.state in ACTIVE else 0
+    if db is not None and job.state in ACTIVE and job.stage == "transcribing":
+        state = db.get(SttState, 1)
+        if state:
+            info["retry_after_seconds"] = math.ceil(
+                max(0, (state.control or {}).get("paused_until", 0) - time.time())
+            )
+    return info
 
 
 def idle(db, meeting_id):
@@ -420,7 +452,7 @@ def meeting_detail(meeting_id: str, user=Depends(current_user), db: DBSession = 
             }
             for a in audio
         ],
-        "job": job_info(job),
+        "job": job_info(job, db),
     }
 
 
@@ -428,7 +460,7 @@ def meeting_detail(meeting_id: str, user=Depends(current_user), db: DBSession = 
 def meeting_status(meeting_id: str, user=Depends(current_user), db: DBSession = Depends(get_db)):
     m = owns(db, Meeting, meeting_id, user)
     job = db.scalar(select(Job).where(Job.meeting_id == m.id).order_by(Job.created.desc()))
-    return {**brief(m), "job": job_info(job)}
+    return {**brief(m), "job": job_info(job, db)}
 
 
 class MeetingEdit(BaseModel):

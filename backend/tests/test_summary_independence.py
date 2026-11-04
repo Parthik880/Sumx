@@ -222,11 +222,15 @@ def test_long_concise_job_retries_only_failed_notes_and_keeps_mode(user_client, 
                                headers={"Idempotency-Key": "long-concise-attempt-123"})
     jid = response.json()["id"]
     calls = []
+    import threading
+    calls_lock = threading.Lock()
     original = provider.summarize
 
     def fail_once(text, mode, synthesis=False, **options):
-        calls.append((text, mode, synthesis, options))
-        if len(calls) == 2:
+        with calls_lock:
+            calls.append((text, mode, synthesis, options))
+            fail = len(calls) == 2
+        if fail:
             raise ProviderError("Temporary failure")
         return original(text, mode, synthesis, **options)
 
@@ -234,11 +238,15 @@ def test_long_concise_job_retries_only_failed_notes_and_keeps_mode(user_client, 
     process_job(jid, provider)
     with DB() as db:
         job = db.get(Job, jid)
-        assert job.state == "failed" and len(job.checkpoint["summary_parts"]) == 1
+        assert job.state == "failed"
+        completed_notes = [part for part in job.checkpoint["summary_parts"] if part is not None]
+        assert completed_notes  # Other in-flight successful notes are saved even when one fails.
+        completed_inputs = {call[0] for call in calls if call is not calls[1]}
     retried = user_client.post(f"/api/meetings/{mid}/jobs/{jid}/retry")
     assert retried.status_code == 200
     process_job(jid, provider)
     assert sum(call[0] == calls[0][0] for call in calls) == 1
+    assert all(sum(call[0] == body for call in calls) == 1 for body in completed_inputs)
     assert all(call[1] == "concise" for call in calls)
     with DB() as db:
         metrics = db.get(Job, jid).payload["summary_metrics"]

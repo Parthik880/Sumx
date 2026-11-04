@@ -68,6 +68,9 @@ import CostAnalytics from "./CostAnalytics";
 import { GoogleSignIn, disableGoogleAutoSelect } from "./GoogleSignIn";
 import { VoiceStudio, VoiceCreator, NarrationPicker } from "./VoiceStudio";
 import NarrationProgress from "./NarrationProgress";
+import { useMeetingPolling } from "./useMeetingPolling";
+import ProcessingProgress from "./ProcessingProgress";
+import { summaryRetrieved, summaryCommitted } from "./summaryTiming";
 import "./voices.css";
 import {
   AdminLogin,
@@ -1035,7 +1038,10 @@ function Capture({ recording = false }: { recording?: boolean }) {
               <option value="standard">Standard</option>
               <option value="detailed">Detailed</option>
             </select>
-            <small>Only the selected summary is generated automatically after transcription.</small>
+            <small>
+              Only the selected summary is generated automatically after
+              transcription.
+            </small>
           </label>
           <label className="check">
             <input
@@ -1087,38 +1093,52 @@ function Capture({ recording = false }: { recording?: boolean }) {
   );
 }
 
-function SummaryView({ content }: { content: Minutes }) {
+const SummaryView = React.memo(function SummaryView({
+  content,
+}: {
+  content: Minutes;
+}) {
+  React.useLayoutEffect(() => {
+    summaryCommitted(content, "layout", null, performance.now());
+  }, [content]);
   return (
-    <div className="minutes">
-      <div className="executive">
-        <SparkleIcon size={24} />
-        <h2>At a glance.</h2>
-        <p>{content.executive_summary}</p>
+    <React.Profiler
+      id="summary"
+      onRender={(_id, phase, actualDuration, _base, _start, commitTime) =>
+        summaryCommitted(content, phase, actualDuration, commitTime)
+      }
+    >
+      <div className="minutes">
+        <div className="executive">
+          <SparkleIcon size={24} />
+          <h2>At a glance.</h2>
+          <p>{content.executive_summary}</p>
+        </div>
+        {(
+          [
+            ["Discussion points", content.discussion_points],
+            ["Decisions", content.decisions],
+            ["Unresolved issues", content.unresolved_issues],
+            ["Follow-up", content.follow_up],
+          ] as [string, string[]][]
+        ).map(([label, items]) => (
+          <section key={label}>
+            <h3>{label}</h3>
+            {items.length ? (
+              <ul>
+                {items.map((s, i) => (
+                  <li key={i}>{s}</li>
+                ))}
+              </ul>
+            ) : (
+              <p className="subtle">None explicitly recorded.</p>
+            )}
+          </section>
+        ))}
       </div>
-      {(
-        [
-          ["Discussion points", content.discussion_points],
-          ["Decisions", content.decisions],
-          ["Unresolved issues", content.unresolved_issues],
-          ["Follow-up", content.follow_up],
-        ] as [string, string[]][]
-      ).map(([label, items]) => (
-        <section key={label}>
-          <h3>{label}</h3>
-          {items.length ? (
-            <ul>
-              {items.map((s, i) => (
-                <li key={i}>{s}</li>
-              ))}
-            </ul>
-          ) : (
-            <p className="subtle">None explicitly recorded.</p>
-          )}
-        </section>
-      ))}
-    </div>
+    </React.Profiler>
   );
-}
+});
 function SummaryEditor({
   content,
   onSave,
@@ -1282,7 +1302,10 @@ function Detail() {
     [records, setRecords] = useState<Record<string, SummaryRecord>>({}),
     [narrationChoice, setNarrationChoice] = useState<SummaryMode | "">(""),
     modeChosen = useRef(false);
-  const summaryAttempt = useRef<{ mode: SummaryMode; key: string } | null>(null),
+  const pendingRecords = useRef(new Set<string>());
+  const summaryAttempt = useRef<{ mode: SummaryMode; key: string } | null>(
+      null,
+    ),
     summarySubmitting = useRef(false);
   const [narrationJobId, setNarrationJobId] = useState<string | undefined>(),
     [narrationPending, setNarrationPending] = useState("");
@@ -1290,40 +1313,10 @@ function Detail() {
     setNarrationJobId(undefined);
     setNarrationPending("");
   }, [id, meeting?.summary_version]);
-  const refresh = useCallback(async () => {
-    const [m, o] = await Promise.all([
-      api<Meeting>("/meetings/" + id),
-      api<SummaryOverview>(`/meetings/${id}/summaries`),
-    ]);
-    setMeeting(m);
-    setOverview(o);
-  }, [id]);
+  const refresh = useMeetingPolling(id, setMeeting, setOverview, setError);
   useEffect(() => {
-    let cancelled = false;
     modeChosen.current = false;
     summaryAttempt.current = null;
-    setOverview(null);
-    const load = () =>
-      Promise.all([
-        api<Meeting>("/meetings/" + id),
-        api<SummaryOverview>(`/meetings/${id}/summaries`),
-      ])
-        .then(([m, o]) => {
-          if (!cancelled) {
-            setMeeting(m);
-            setOverview(o);
-            setError("");
-          }
-        })
-        .catch((e) => {
-          if (!cancelled) setError(e.message);
-        });
-    void load();
-    const interval = setInterval(load, 2500);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
   }, [id]);
   useEffect(() => {
     if (!overview || modeChosen.current) return;
@@ -1337,11 +1330,14 @@ function Detail() {
     if (summaryAttempt.current?.mode !== mode)
       summaryAttempt.current = { mode, key: crypto.randomUUID() };
     const key = summaryAttempt.current.key;
-    await perform(async () => {
-      await post(`/meetings/${id}/summaries/${mode}/generate`, {}, key);
-      summaryAttempt.current = null;
-    });
-    summarySubmitting.current = false;
+    try {
+      await perform(async () => {
+        await post(`/meetings/${id}/summaries/${mode}/generate`, {}, key);
+        summaryAttempt.current = null;
+      });
+    } finally {
+      summarySubmitting.current = false;
+    }
   }
   const options = overview?.narration_options ?? [];
   const narrationMode =
@@ -1363,16 +1359,23 @@ function Detail() {
           held.audio?.length === info.audio_count)
       )
         continue;
+      const requestKey = `${key}:${info.version}:${info.audio_count}`;
+      if (pendingRecords.current.has(requestKey)) continue;
+      pendingRecords.current.add(requestKey);
+      const began = performance.now();
       void api<SummaryRecord>(`/meetings/${id}/summaries/${mode}`)
-        .then((record) =>
+        .then((record) => {
+          if (record.content)
+            summaryRetrieved(record.content, id!, mode, record.version, began);
           // Filed under its own mode, so a late reply can never reach another mode.
           setRecords((current) =>
             (current[key]?.version ?? 0) > (record.version ?? 0)
               ? current
               : { ...current, [key]: record },
-          ),
-        )
-        .catch((e) => setError(e.message));
+          );
+        })
+        .catch((e) => setError(e.message))
+        .finally(() => pendingRecords.current.delete(requestKey));
     }
   }, [overview, detail, narrationMode, id, records]);
   async function perform(operation: () => Promise<unknown>, message?: string) {
@@ -1496,40 +1499,13 @@ function Detail() {
           )}
         </Notice>
       )}
-      {processing && m.job?.kind !== "speech" && (
-        <div className="processing-panel" role="status">
-          <span className="processing-icon">
-            <WaveformIcon size={24} />
-          </span>
-          <div>
-            <strong>
-              {
-                (
-                  {
-                    queued: "Waiting for the processing worker",
-                    extracting: "Extracting compatible audio",
-                    transcribing: "Transcribing your recording",
-                    summarizing: "Writing your meeting minutes",
-                    generating_speech: "Generating summary narration",
-                  } as Record<string, string>
-                )[m.status]
-              }
-            </strong>
-            <p>
-              {m.job?.total
-                ? `${m.job.completed} of ${m.job.total} parts complete`
-                : "Your progress is saved. You can leave this page and return later."}
-            </p>
-          </div>
-          {!!m.job?.total && (
-            <progress
-              max={m.job.total}
-              value={m.job.completed}
-              aria-label="Completed processing parts"
-            />
-          )}
-        </div>
-      )}
+      {m.job &&
+        m.job.kind !== "speech" &&
+        (processing ||
+          (m.job.state === "completed" &&
+            ["pipeline", "summarize"].includes(m.job.kind))) && (
+          <ProcessingProgress job={m.job} status={m.status} />
+        )}
       <div className="segmented" role="tablist" aria-label="Meeting content">
         {["summary", "transcript", "actions", "audio"].map((t) => (
           <button

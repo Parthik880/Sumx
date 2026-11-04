@@ -18,7 +18,7 @@ def digest(value: str):
 
 
 def origin_check(request: Request):
-    if request.headers.get("origin") != settings.app_url:
+    if request.headers.get("origin") not in settings.frontend_origins:
         raise HTTPException(403, "Request origin is not permitted")
 
 

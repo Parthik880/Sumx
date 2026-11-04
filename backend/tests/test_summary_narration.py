@@ -102,7 +102,10 @@ class Router:
         return content, {}, None
 
 
-def test_one_bounded_correction_only_when_far_over_budget():
+def test_one_bounded_correction_only_when_far_over_budget(monkeypatch):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "summary_chunk_chars", 24000)
     router = Router(words=2000)
     _, info = build_summary(router, "word " * 3000, "concise", lambda *a: None)
     assert info["corrected"] and len(router.calls) == 2
@@ -112,7 +115,10 @@ def test_one_bounded_correction_only_when_far_over_budget():
     assert not info["corrected"] and len(router.calls) == 1
 
 
-def test_short_results_are_not_padded():
+def test_short_results_are_not_padded(monkeypatch):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "summary_chunk_chars", 24000)
     router = Router(words=5)
     _, info = build_summary(router, "word " * 3000, "detailed", lambda *a: None)
     assert len(router.calls) == 1 and info["summary_words"] < info["target_words"]
@@ -255,6 +261,7 @@ def test_truncated_summary_retries_once_with_a_larger_budget_and_records_both_ca
     import httpx
 
     monkeypatch.setattr(settings, "openrouter_api_key", "test-key")
+    monkeypatch.setattr(settings, "summary_chunk_chars", 24000)
     budgets = []
 
     def handler(request):
@@ -289,6 +296,58 @@ def test_notes_budget_covers_observed_long_meeting_output():
     from backend.provider import summary_token_budget
 
     assert summary_token_budget(578) >= 3000
+
+
+@pytest.mark.parametrize('model,reasoning', [
+    ('deepseek/deepseek-v4.1-flash-1017', {'enabled': False}),
+    ('deepseek/deepseek-v4-flash', {'enabled': False}),
+    ('google/gemini-2.5-flash-lite', None),
+])
+def test_summary_reserves_visible_output_for_deepseek_v4(monkeypatch, model, reasoning):
+    import httpx
+    from backend.config import settings
+    from backend.provider import OpenRouter
+
+    monkeypatch.setattr(settings, 'openrouter_summary_model', model)
+    monkeypatch.setattr(settings, 'openrouter_api_key', 'test-key')
+
+    def handler(request):
+        body = json.loads(request.content)
+        assert body.get('reasoning') == reasoning
+        assert body['model'] == model
+        return httpx.Response(200, json={'choices': [
+            {'finish_reason': 'stop', 'message': {'content': json.dumps(MINUTES)}}
+        ]})
+
+    router = OpenRouter(httpx.Client(transport=httpx.MockTransport(handler)))
+    try:
+        content, _, _ = router.summarize('The meeting approved the plan.', 'standard')
+        assert content['title'] == MINUTES['title']
+    finally:
+        router.close()
+
+
+def test_long_summary_covers_every_chunk_then_merges_notes(monkeypatch):
+    from backend.config import settings
+    from backend.media import text_chunks
+
+    monkeypatch.setattr(settings, 'summary_chunk_chars', 12000)
+    transcript = ' '.join(f'Topic {n}: review the plan and record the decision.' for n in range(1000))
+    expected = text_chunks(transcript, 12000)
+    seen = []
+    router = Router(words=30)
+    summarize = router.summarize
+
+    def track(body, detail, synthesis=False, **options):
+        if options.get('notes') and not synthesis:
+            seen.append(body)
+        return summarize(body, detail, synthesis, **options)
+
+    router.summarize = track
+    content, info = build_summary(router, transcript, 'standard', lambda *args: None)
+    assert len(seen) > 1 and seen == expected
+    assert ''.join(seen).replace(' ', '') == transcript.replace(' ', '')
+    assert info['synthesis_calls'] == 1 and content['title'] == MINUTES['title']
 
 
 def test_long_meeting_merges_all_notes_in_one_final_call(monkeypatch):

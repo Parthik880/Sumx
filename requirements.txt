@@ -1,0 +1,29 @@
+# Core scientific stack
+numpy==1.26.4
+scipy==1.13.1
+pandas
+matplotlib==3.9.2
+
+# Motion-capture / data formats
+c3d==0.5.2
+lxml==5.3.0
+xlrd
+python-dateutil
+
+# GUI
+PyQt5==5.15.4
+Quamash==0.6.1
+pywin32==304
+
+# gRPC / Qualisys QTM integration
+grpcio
+grpcio-tools
+protobuf==5.29.5
+qtm-rt @ git+https://github.com/qualisys/qualisys_python_sdk.git@17df35e6a8c95c2931159a4e5833d61da5aa68d3
+
+# Reporting / utilities
+reportlab
+astor==0.8.1
+
+# Testing
+pytest

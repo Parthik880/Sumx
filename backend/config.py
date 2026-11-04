@@ -44,7 +44,10 @@ class Settings(BaseSettings):
     qwen_clone_seed: int | None = Field(default=None, ge=0, le=2147483647)
     qwen_clone_debug: bool = False
     openrouter_stt_timestamps: bool = True
-    summary_chunk_chars: int = 24000
+    summary_chunk_chars: int = 12000
+    summary_note_concurrency: int = Field(default=2, ge=1, le=4)
+    summary_request_deadline_seconds: int = Field(default=180, ge=1, le=600)
+    summary_pipeline_deadline_seconds: int = Field(default=600, ge=1, le=3600)
     audio_chunk_seconds: int = 180
     stt_adaptive: bool = True
     stt_initial_concurrency: int = Field(default=2, ge=1, le=12)
@@ -64,6 +67,15 @@ class Settings(BaseSettings):
     max_duration_seconds: int = 14400
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
+
+    @property
+    def frontend_origins(self) -> list[str]:
+        """Allow the two loopback names only for local HTTP development."""
+        origin = urlsplit(self.app_url)
+        if origin.scheme == "http" and origin.hostname in ("localhost", "127.0.0.1"):
+            port = f":{origin.port}" if origin.port else ""
+            return [f"http://localhost{port}", f"http://127.0.0.1{port}"]
+        return [self.app_url]
 
     @model_validator(mode="after")
     def validate_frontend_origin(self):

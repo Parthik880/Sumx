@@ -2,6 +2,8 @@ import asyncio
 import json
 import random
 import time
+import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from decimal import Decimal
@@ -9,6 +11,8 @@ import httpx
 from .config import settings
 from .money import usd
 from .schema import Minutes
+
+summary_log = logging.getLogger("sumx.summary.provider")
 
 
 # Only responses that clearly did not run the transcription are retried automatically.
@@ -104,7 +108,10 @@ def retry_after(response):
 
 
 class OpenRouter:
+    summary_telemetry = True
+
     def __init__(self, client=None, async_transport=None):
+        self._injected_summary_client = client is not None
         self.client = client or httpx.Client(timeout=httpx.Timeout(90, connect=15), follow_redirects=False)
         self.async_transport = async_transport
         self._speech_rate = None
@@ -301,7 +308,7 @@ class OpenRouter:
                 segments.append(segment)
         return {"text": data["text"], "segments": segments, "language": data.get("language")}, data, response
 
-    def summarize(
+    def summary_body(
         self, text, detail, synthesis=False, *, target_words=600, notes=False, correction=False, token_scale=1
     ):
         prompt = (
@@ -314,7 +321,7 @@ class OpenRouter:
             "is a decision, not an action item. Do not list a topic merely because someone suggested it. "
             "Only use action timestamp when supplied timing supports it. "
             "Return one JSON object matching this schema: "
-            + json.dumps(Minutes.model_json_schema())
+            + json.dumps(Minutes.model_json_schema(), ensure_ascii=False, separators=(",", ":"))
             + "\n"
             + mode_instructions(detail, target_words, notes, correction)
             + " "
@@ -331,7 +338,101 @@ class OpenRouter:
             "max_tokens": min(16000, summary_token_budget(target_words) * token_scale),
             "response_format": {"type": "json_object"},
         }
-        response = self.request("POST", "/chat/completions", json=body)
+        if settings.openrouter_summary_model.startswith("deepseek/deepseek-v4"):
+            # V4 can spend the entire completion budget on optional reasoning,
+            # leaving no room for the validated meeting-minutes JSON.
+            body["reasoning"] = {"enabled": False}
+        return body
+
+    @asynccontextmanager
+    async def summary_session(self):
+        if self._injected_summary_client:
+            yield None  # Existing offline sync transports remain supported by the test suite.
+        else:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(90, connect=15), follow_redirects=False,
+                limits=httpx.Limits(max_connections=settings.summary_note_concurrency,
+                                   max_keepalive_connections=settings.summary_note_concurrency),
+            ) as client:
+                yield client
+
+    async def _summary_request(self, body, client, on_event=None):
+        if not settings.openrouter_api_key:
+            raise ProviderError("OPENROUTER_API_KEY is not configured on the server")
+        began = time.perf_counter()
+        events = []
+
+        def emit(event, **values):
+            item = {"event": event, "at": time.time(), "elapsed_seconds": time.perf_counter() - began,
+                    "model": body["model"], **values}
+            events.append(item)
+            summary_log.info("summary_transport %s", json.dumps(item))
+            if on_event:
+                on_event(item)
+
+        try:
+            async with asyncio.timeout(settings.summary_request_deadline_seconds):
+                for attempt in range(1, 4):
+                    emit("request_started", attempt=attempt)
+                    request_started = time.perf_counter()
+                    headers = {"Authorization": "Bearer " + settings.openrouter_api_key, "X-Title": "SUMX"}
+                    url = settings.openrouter_base_url.rstrip("/") + "/chat/completions"
+                    if client is None:
+                        response = await asyncio.to_thread(self.client.request, "POST", url,
+                                                           headers=headers, json=body)
+                        header_seconds = None
+                    else:
+                        async with client.stream("POST", url, headers=headers, json=body) as response:
+                            header_seconds = time.perf_counter() - request_started
+                            emit("headers_received", attempt=attempt, status=response.status_code,
+                                 headers_seconds=header_seconds)
+                            await response.aread()
+                    emit("response_received", attempt=attempt, status=response.status_code,
+                         request_seconds=time.perf_counter() - request_started,
+                         headers_seconds=header_seconds, response_bytes=len(response.content))
+                    if response.status_code == 400 and "response_format" in body:
+                        body = {k: v for k, v in body.items() if k != "response_format"}
+                        emit("format_fallback", attempt=attempt)
+                        if attempt < 3:
+                            continue
+                    if response.status_code in (429, 502, 503, 504) and attempt < 3:
+                        delay = max(min(5, 2 ** (attempt - 1)), retry_after(response) or 0)
+                        emit("retry_wait", attempt=attempt, wait_seconds=delay, retry_until=time.time() + delay)
+                        wait_started = time.perf_counter()
+                        try:
+                            await asyncio.sleep(delay)
+                        finally:
+                            emit("retry_wait_finished", attempt=attempt, wait_seconds=time.perf_counter() - wait_started)
+                        continue
+                    if response.status_code == 401:
+                        await asyncio.to_thread(self.check_key)
+                    if not response.is_success:
+                        raise ProviderError(f"OpenRouter rejected the summary request (HTTP {response.status_code}).",
+                                            response=response)
+                    response.extensions["sumx_summary_transport"] = events
+                    return response
+        except TimeoutError as exc:
+            emit("deadline_exceeded", deadline_seconds=settings.summary_request_deadline_seconds)
+            raise ProviderError("The summary provider exceeded the request deadline. Completed notes are saved; retry the failed stage.") from exc
+        except httpx.TransportError as exc:
+            emit("transport_error", error_type=type(exc).__name__)
+            raise ProviderError("The summary provider connection failed; completed notes are saved. Retrying may incur another charge.") from exc
+
+    async def summarize_async(self, text, detail, synthesis=False, *, client=None, on_event=None, **options):
+        body = self.summary_body(text, detail, synthesis, **options)
+        if client is None and not self._injected_summary_client:
+            async with self.summary_session() as shared:
+                return await self.summarize_async(text, detail, synthesis, client=shared, on_event=on_event, **options)
+        response = await self._summary_request(body, client, on_event)
+        began = time.perf_counter()
+        result = self.parse_summary(response)
+        response.extensions["sumx_summary_validation_seconds"] = time.perf_counter() - began
+        return result
+
+    def summarize(self, text, detail, synthesis=False, **options):
+        return asyncio.run(self.summarize_async(text, detail, synthesis, **options))
+
+    def parse_summary(self, response):
         data = self.json(response)
         choices = data.get("choices")
         if isinstance(choices, list) and choices and choices[0].get("finish_reason") == "length":
@@ -352,6 +453,13 @@ class OpenRouter:
                 content = content[0]
             minutes = Minutes.model_validate(content)
         except (KeyError, IndexError, ValueError, TypeError) as exc:
+            # Record schema locations/types only; validation inputs may contain private minutes.
+            errors = getattr(exc, "errors", None)
+            fields = [{"loc": list(e["loc"]), "type": e["type"]} for e in errors(include_input=False)] if errors else []
+            summary_log.warning("summary_validation_failed %s", json.dumps({
+                "error_type": type(exc).__name__, "fields": fields,
+                "generation_id": data.get("id"), "http_status": response.status_code,
+            }))
             raise ProviderError(
                 "Summary response did not match the required meeting-minutes schema",
                 response,

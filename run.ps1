@@ -1,6 +1,8 @@
 param([ValidateSet('api','worker','tts','web')][string]$Service = 'web')
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
+# Existing terminals may predate user-scoped FFmpeg/Python installations.
+$env:Path = $env:Path + ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
 switch ($Service) {
     'api' {
         $projectPattern=[regex]::Escape($PSScriptRoot)

@@ -30,6 +30,21 @@ export type Job = {
   completed: number;
   total: number;
   error: string | null;
+  retry_after_seconds?: number;
+  summary_retry_after_seconds?: number;
+  started_at?: number;
+  completed_at?: number;
+  elapsed_seconds?: number;
+  progress_percent?: number;
+  summary_progress?: {
+    stage?: string;
+    stage_started_at?: number;
+    notes_completed?: number;
+    notes_total?: number;
+    mode?: SummaryMode;
+    timings?: Record<string, number>;
+    saved_at?: number;
+  };
 };
 export type SummaryMode = "concise" | "standard" | "detailed";
 export type SummaryInfo = {

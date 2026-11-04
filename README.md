@@ -209,7 +209,7 @@ All server settings below belong in root `.env`. Defaults are shown in `.env.exa
 | `AUDIO_CHUNK_SECONDS` | Transcription chunk duration; default 180 seconds | Optional |
 | `STT_CONCURRENCY` | Chunks transcribed at once, 1–8; default 4 | Optional |
 | `STT_OVERLAP_SECONDS` | Extra audio per chunk protecting boundary words, 0–5; default 1.5 | Optional |
-| `SUMMARY_CHUNK_CHARS` | Transcript summary chunk size; default 24,000 | Optional |
+| `SUMMARY_CHUNK_CHARS` | Transcript summary chunk size; default 12,000 | Optional |
 | `MAX_UPLOAD_MB` / `MAX_DURATION_SECONDS` | Optional upload cap in MB (`0` = no size limit, default) / duration cap (14,400 seconds by default) | Optional |
 | `FFMPEG` / `FFPROBE` | Executable names or paths | Required on PATH or configured |
 | `TTS_ENABLED` | Enable speech generation; default `true` | Optional |

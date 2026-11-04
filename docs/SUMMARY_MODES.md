@@ -6,6 +6,8 @@
 
 Transcripts longer than `SUMMARY_CHUNK_CHARS` become notes first, and all notes then go into one final call that sets the length. Only very long meetings merge in groups, and notes are never split. If a response is cut off or malformed, it retries once with double the token budget, and both calls are recorded in the cost ledger. If a result is over 125% of target, one shortening pass runs. Summaries are never padded, so a short meeting can fall below target.
 
+The default chunk size is 12,000 characters. DeepSeek V4 requests explicitly disable optional reasoning so the completion budget is available for the summary JSON. Reasoning and visible output share that budget; increasing the limit alone can otherwise produce another truncated answer. See [OpenRouter's reasoning token contract](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
+
 Each summary stores its `detail` and `prompt_version`, which includes the prompt and model. Viewing a saved mode never calls the LLM. Generate or Regenerate intentionally adds a revision only for its selected mode; retrying the same idempotency key returns the same job instead. Keys are scoped by meeting, mode and generation attempt. Raise `PROMPT_VERSION` after changing a prompt.
 
 The narration selector uses the exact saved version of its chosen mode. Saved audio is matched on a hash of the spoken words, so different wording never matches, and returning to an unchanged mode reuses its audio.

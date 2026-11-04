@@ -130,13 +130,19 @@ def test_connection_failure_retries_because_nothing_was_sent(fast):
 
 def test_failure_keeps_finished_chunks_and_resume_runs_only_the_rest(fast):
     calls, broken = [], [True]
+    stored = {}
 
-    def handler(request):
+    async def handler(request):
         index = index_of(request)
         calls.append(index)
+        if index == 1 and broken[0]:
+            # Exercise a failure after a durable success, independent of thread scheduling.
+            async with asyncio.timeout(2):
+                while 0 not in stored:
+                    await real_sleep(.001)
         return httpx.Response(400) if index == 1 and broken[0] else ok(index)
 
-    stored, _, _, error = run(router_for(handler), fast, 5 * 180)
+    stored, _, _, error = run(router_for(handler), fast, 5 * 180, stored)
     assert isinstance(error, ProviderError) and 1 not in stored and 0 in stored
     before = set(stored)
     broken[0] = False

@@ -208,6 +208,7 @@ def test_throttle_is_shared_between_worker_budgets(monkeypatch):
     from backend.models import SttState
 
     monkeypatch.setattr(settings, "stt_initial_concurrency", 4)
+    monkeypatch.setattr(settings, "stt_concurrency_levels", [4, 2, 1])
     a, b = GlobalBudget("worker-a"), GlobalBudget("worker-b")
     first, second = a.try_take(), b.try_take()
     a.feedback(first, ProviderError("throttled", kind="rate_limit", retry_after=120))
@@ -234,6 +235,7 @@ def test_shared_capacity_recovers_after_stable_successes(monkeypatch):
     from backend.models import SttState
 
     monkeypatch.setattr(settings, "stt_initial_concurrency", 2)
+    monkeypatch.setattr(settings, "stt_concurrency_levels", [4, 2, 1])
     monkeypatch.setattr(settings, "stt_increase_cooldown_seconds", 0)
     monkeypatch.setattr(settings, "stt_increase_successes", 12)
     budget = GlobalBudget("stable")
@@ -264,6 +266,7 @@ def test_reduced_global_cap_waits_for_high_numbered_slots_to_drain(monkeypatch):
     from backend.models import SttState
 
     monkeypatch.setattr(settings, "stt_initial_concurrency", 4)
+    monkeypatch.setattr(settings, "stt_concurrency_levels", [4, 2, 1])
     old, new = GlobalBudget("old"), GlobalBudget("new")
     slots = [old.try_take() for _ in range(4)]
     old.feedback(slots[0], ProviderError("limit", kind="rate_limit", retry_after=1))
@@ -277,6 +280,24 @@ def test_reduced_global_cap_waits_for_high_numbered_slots_to_drain(monkeypatch):
     assert new.try_take() is None
     old.release(slots[2])
     assert new.try_take() is not None
+
+
+def test_three_parallel_requests_share_capacity_and_back_off_to_two(monkeypatch):
+    from backend.models import SttState
+
+    monkeypatch.setattr(settings, "stt_initial_concurrency", 3)
+    monkeypatch.setattr(settings, "stt_concurrency_levels", [4, 3, 2, 1])
+    first, other = GlobalBudget("first"), GlobalBudget("other")
+    slots = [first.try_take() for _ in range(3)]
+    assert set(slots) == {0, 1, 2}
+    assert other.try_take() is None
+    first.feedback(slots[0], ProviderError("throttled", kind="rate_limit", retry_after=120))
+    first.feedback(slots[1], ProviderError("same burst", kind="rate_limit", retry_after=120))
+    with DB() as db:
+        assert db.get(SttState, 1).level == 2
+    for slot in slots:
+        first.release(slot)
+    assert other.try_take() is None, "provider cooldown is shared even after slots drain"
 
 
 def test_large_plan_has_a_bounded_number_of_scheduler_tasks(fast):
